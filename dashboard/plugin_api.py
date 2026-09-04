@@ -151,7 +151,7 @@ def upsert_secret(body: SecretBody):
     }
     if existing:
         payload = {**existing, **item, "id": existing["id"]}
-        argv = ["edit", "item", _b64(payload)]
+        argv = ["edit", "item", existing["id"], _b64(payload)]
     else:
         argv = ["create", "item", _b64(item)]
     proc = _run_bw(argv, session=session, stdin_data="", timeout=60)
