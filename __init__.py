@@ -273,6 +273,35 @@ def _load_dv_cfg() -> dict:
         return {"folder": "hermes"}
 
 
+def _maybe_render_file_shims() -> None:
+    """Render vault-managed files for non-Hermes consumers (fail-open).
+
+    Loads dropvault/tools/render_files.py (plugin-relative first, then the
+    workspace copy) and calls render_all(). Never raises; never logs values.
+    """
+    import importlib.util
+    import logging
+    rlog = logging.getLogger("dropvault.file-shims")
+    candidates = [
+        Path(__file__).resolve().parent / "tools" / "render_files.py",
+        Path.home() / "workspace" / "dropvault" / "tools" / "render_files.py",
+    ]
+    script = next((c for c in candidates if c.is_file()), None)
+    if script is None:
+        return
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "dropvault_render_files", str(script))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        reports = mod.render_all()
+        changed = sum(1 for r in reports if r.get("changed"))
+        rlog.info("file shims rendered: %d targets, %d changed",
+                  len(reports), changed)
+    except Exception as exc:
+        rlog.warning("file shim render skipped: %s", exc)
+
+
 def _auto_sync_loop(mins: int) -> None:
     """Watch the vault folder; re-apply env secrets on change (no restart).
 
@@ -308,6 +337,10 @@ def _auto_sync_loop(mins: int) -> None:
                 reset_secret_source_cache()
                 _apply_external_secret_sources(Path.home())
                 wlog.info("dropvault auto-sync: changed vault re-applied to env")
+                try:
+                    _maybe_render_file_shims()
+                except Exception:
+                    pass  # render is fail-open; never crash the loop
         except Exception:
             continue
 
@@ -325,6 +358,16 @@ def _start_auto_sync() -> None:
         return
     threading.Thread(target=_auto_sync_loop, args=(mins,),
                      name="dropvault-auto-sync", daemon=True).start()
+    # One-shot render shortly after startup hydration (fail-open, guarded).
+    def _delayed_startup_render() -> None:
+        import time
+        time.sleep(45)
+        try:
+            _maybe_render_file_shims()
+        except Exception:
+            pass
+    threading.Thread(target=_delayed_startup_render,
+                     name="dropvault-file-shims-startup", daemon=True).start()
 
 
 if not globals().get("_DV_WATCHDOG_STARTED"):
