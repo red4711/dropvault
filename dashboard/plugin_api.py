@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import shutil
+import time
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -268,6 +269,26 @@ def sync():
     if proc.returncode != 0:
         raise HTTPException(502, f"bw sync failed: {proc.stderr.strip()[:200]}")
     return {"ok": True}
+
+@router.post("/sync-env")
+def sync_env():
+    """Ask the gateway watchdog to re-apply vault secrets to the OS env now.
+
+    The dashboard runs in a different process than the gateway, so it cannot
+    reach the gateway's os.environ directly — instead it drops a trigger
+    file that the gateway-side dropvault watchdog notices within ~5 seconds
+    and uses to force a re-apply (env + file shims).
+    """
+    _require_unlocked()
+    from pathlib import Path as _P
+    trigger = _P.home() / ".hermes" / "cache" / "dropvault-sync.trigger"
+    trigger.parent.mkdir(parents=True, exist_ok=True)
+    trigger.write_text(str(time.time()))
+    try:
+        trigger.chmod(0o600)
+    except Exception:
+        pass
+    return {"ok": True, "note": "gateway applies within ~5s"}
 
 
 # ---------------------------------------------------------------------------

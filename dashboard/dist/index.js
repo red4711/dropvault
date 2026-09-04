@@ -106,7 +106,18 @@
       setBusy(true); setNotice(null);
       try {
         await api("/sync", { method: "POST", body: "{}" });
-        setNotice("Vault synced. New secrets are picked up on next Hermes restart (or by the source re-pull).");
+        setNotice("Vault cache synced from the server. Add or update secrets, then press Sync env to push them into the running tools.");
+        await refresh();
+      } catch (e) {
+        setError(e.message);
+      } finally { setBusy(false); }
+    }
+
+    async function doSyncEnv() {
+      setBusy(true); setNotice(null);
+      try {
+        await api("/sync-env", { method: "POST", body: "{}" });
+        setNotice("Sync requested — the gateway applies vault secrets to its environment (and file shims) within ~5 seconds.");
         await refresh();
       } catch (e) {
         setError(e.message);
@@ -166,7 +177,9 @@
           status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
             busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
           status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy },
-            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"))),
+            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
+          status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy },
+            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"))),
 
       error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" }, error)),
       notice && h(Card, { key: "ok" }, h(CardContent, { className: "text-sm text-muted-foreground py-3" }, notice)),
