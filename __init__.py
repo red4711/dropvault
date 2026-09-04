@@ -117,6 +117,29 @@ class VwVaultSource(SecretSource):
         except Exception:
             return s
 
+    def _ensure_server(self, cfg: dict, env: dict) -> None:
+        """Point `bw` at the configured Vaultwarden URL (decoupling: any
+        reachable Vaultwarden/Bitwarden server works — not just the local
+        one). No-op when the server already matches; never raises."""
+        url = (self._cfg_get(cfg or {}, "server_url", None) or "").strip()
+        if not url:
+            return
+        try:
+            cli = self._resolve_cli(cfg or {}) or "bw"
+            st = subprocess.run([cli, "status"], env=env,
+                                capture_output=True, text=True, timeout=30)
+            cur = ""
+            try:
+                cur = (json.loads(st.stdout).get("serverUrl") or "")
+            except Exception:
+                pass
+            if cur.rstrip("/") == url.rstrip("/"):
+                return
+            run_secret_cli([cli, "config", "server", url],
+                           allow_env=(), extra_env=env, timeout=30)
+        except Exception:
+            pass  # best-effort; fetch surfaces real errors
+
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
         result = FetchResult()
         env = get_source_environment()
@@ -140,6 +163,9 @@ class VwVaultSource(SecretSource):
         timeout = float(self._cfg_get(cfg, "cli_timeout_seconds", 30.0))
 
         try:
+            # 0. pin bw to the configured server (any reachable Vaultwarden)
+            self._ensure_server(cfg, get_source_environment())
+
             # 1. vault must be unlocked
             _, status = self._bw_json(["status"], session, timeout, cfg)
             state = status.get("status")
@@ -230,3 +256,80 @@ class VwVaultSource(SecretSource):
 
 def register(ctx):
     ctx.register_secret_source(VwVaultSource())
+
+
+# ---------------------------------------------------------------------------
+# Auto-sync watchdog (opt-out via secrets.dropvault.auto_sync_minutes: 0)
+# ---------------------------------------------------------------------------
+
+def _load_dv_cfg() -> dict:
+    """Read secrets.dropvault config without raising (folder default 'hermes')."""
+    import yaml
+    try:
+        data = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+        dv = (data.get("secrets") or {}).get("dropvault") or {}
+        return {k: v for k, v in dv.items() if k != "enabled"} or {"folder": "hermes"}
+    except Exception:
+        return {"folder": "hermes"}
+
+
+def _auto_sync_loop(mins: int) -> None:
+    """Watch the vault folder; re-apply env secrets on change (no restart).
+
+    Cheap poll: hash of (name, value) pairs, computed locally — values never
+    logged. Stays silent when the vault is locked. On change, resets the
+    secret-source cache and re-applies so the running gateway picks up new
+    values without a restart.
+    """
+    import time, hashlib, logging
+    wlog = logging.getLogger("dropvault.watchdog")
+    src = VwVaultSource()
+    cfg = _load_dv_cfg()
+    last_hash = None
+    while True:
+        time.sleep(max(1, mins) * 60)
+        try:
+            res = src.fetch(cfg, Path.home())
+            if not res.ok or not res.secrets:
+                continue  # locked / not configured — stay quiet
+            h = hashlib.sha256()
+            for k in sorted(res.secrets):
+                h.update(k.encode()); h.update(b"=")
+                h.update(res.secrets[k].encode())
+            cur = h.hexdigest()
+            if last_hash is None:
+                last_hash = cur  # first tick = baseline, no action
+                continue
+            if cur != last_hash:
+                last_hash = cur
+                wlog.info("vault change detected — re-applying secrets to env")
+                from hermes_cli.env_loader import (reset_secret_source_cache,
+                                                   _apply_external_secret_sources)
+                reset_secret_source_cache()
+                _apply_external_secret_sources(Path.home())
+                wlog.info("dropvault auto-sync: changed vault re-applied to env")
+        except Exception:
+            continue
+
+
+def _start_auto_sync() -> None:
+    """Start the watchdog unless disabled via secrets.dropvault.auto_sync_minutes."""
+    import yaml, threading
+    try:
+        data = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+        mins = int(((data.get("secrets") or {}).get("dropvault") or {})
+                   .get("auto_sync_minutes", 10))
+    except Exception:
+        mins = 10
+    if mins <= 0:
+        return
+    threading.Thread(target=_auto_sync_loop, args=(mins,),
+                     name="dropvault-auto-sync", daemon=True).start()
+
+
+if not globals().get("_DV_WATCHDOG_STARTED"):
+    globals()["_DV_WATCHDOG_STARTED"] = True
+    try:
+        _start_auto_sync()
+    except Exception:
+        pass  # never block plugin import

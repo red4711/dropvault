@@ -39,6 +39,21 @@
     });
   }
 
+  // Small inline spinner (currentColor), sized via className.
+  function Spinner({ className }) {
+    return h("svg", {
+      className: cn("animate-spin", className || "h-4 w-4"),
+      viewBox: "0 0 24 24", fill: "none",
+      "aria-hidden": "true",
+    }, h("circle", {
+      className: "opacity-25", cx: "12", cy: "12", r: "10",
+      stroke: "currentColor", strokeWidth: "4",
+    }), h("path", {
+      className: "opacity-75", fill: "currentColor",
+      d: "M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z",
+    }));
+  }
+
   function App() {
     const [status, setStatus] = useState(null);
     const [secrets, setSecrets] = useState(null);
@@ -49,6 +64,7 @@
     const [value, setValue] = useState("");
     const [notes, setNotes] = useState("");
     const [busy, setBusy] = useState(false);
+    const [unlocking, setUnlocking] = useState(false);
     const [showForm, setShowForm] = useState(false);
     const [editName, setEditName] = useState(null);
 
@@ -58,6 +74,7 @@
         const st = await api("/status");
         setStatus(st);
         if (st.ok) {
+          setSecrets(null); // show loading skeleton while the folder decrypts
           const s = await api("/secrets");
           setSecrets(s.secrets);
         } else {
@@ -72,14 +89,14 @@
 
     async function doUnlock(e) {
       e.preventDefault();
-      setBusy(true); setError(null);
+      setUnlocking(true); setError(null);
       try {
         await api("/unlock", { method: "POST", body: JSON.stringify({ password: pw }) });
         setPw("");
         await refresh();
       } catch (e2) {
         setError(e2.message);
-      } finally { setBusy(false); }
+      } finally { setUnlocking(false); }
     }
 
     async function doLock() {
@@ -128,9 +145,20 @@
       } finally { setBusy(false); }
     }
 
-    const statusBadge = !status ? "…" :
+    const statusBadge = !status ? h(Spinner, { className: "h-4 w-4 text-muted-foreground" }) :
       status.ok ? h(Badge, { key: "b" }, "unlocked") :
       h(Badge, { key: "b", variant: "destructive" }, status.vault);
+
+    // 3 skeleton rows shown while the folder content decrypts/loads.
+    function SecretSkeleton() {
+      return h("div", { className: "py-2 space-y-2", "aria-busy": "true" },
+        h("div", { className: "flex items-center gap-2 text-sm text-muted-foreground" },
+          h(Spinner, { className: "h-3.5 w-3.5" }), "Decrypting folder contents…"),
+        [64, 96, 80].map((w, i) =>
+          h("div", { key: i, className: "flex items-center justify-between py-2" },
+            h("div", { className: "h-4 rounded bg-muted animate-pulse", style: { width: w + "px" } }),
+            h("div", { className: "h-4 w-14 rounded bg-muted animate-pulse" }))));
+    }
 
     return h("div", { className: "p-6 space-y-6 max-w-3xl mx-auto" },
       // header
@@ -140,11 +168,18 @@
           h("p", { className: "text-sm text-muted-foreground" },
             "Secrets in the local Vaultwarden — values never enter chat or logs.")),
         h("div", { className: "flex items-center gap-2" }, statusBadge,
-          status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy }, "Lock"),
-          status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy }, "Sync"))),
+          status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
+            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
+          status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy },
+            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"))),
 
       error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" }, error)),
       notice && h(Card, { key: "ok" }, h(CardContent, { className: "text-sm text-muted-foreground py-3" }, notice)),
+
+      // initial status check
+      !status && h(Card, { key: "st" },
+        h(CardContent, { className: "py-6 flex items-center justify-center gap-2 text-sm text-muted-foreground" },
+          h(Spinner, { className: "h-4 w-4" }), "Checking vault status…")),
 
       // unlock form
       status && !status.ok && h(Card, { key: "u" },
@@ -153,8 +188,10 @@
             h("div", { className: "flex-1" },
               h(Label, null, "Master password"),
               h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
-                         placeholder: "vault master password", autoFocus: true })),
-            h(Button, { type: "submit", disabled: busy || !pw }, "Unlock")))),
+                         placeholder: "vault master password", autoFocus: true, disabled: unlocking })),
+            h(Button, { type: "submit", disabled: unlocking || !pw },
+              unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
+              unlocking ? "Unlocking…" : "Unlock")))),
 
       status && !status.cli && h(Card, { key: "cli" },
         h(CardContent, { className: "py-3 text-sm" },
@@ -183,7 +220,11 @@
               h("div", { className: "flex gap-2 justify-end" },
                 h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
                 h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
+                  busy && h(Spinner, { className: "h-4 w-4 mr-2" }),
                   editName ? "Update" : "Create"))))),
+
+        status.ok && secrets === null && h(Card, { key: "load" },
+          h(CardContent, { className: "py-2" }, h(SecretSkeleton))),
 
         secrets && h(Card, { key: "list" },
           h(CardContent, { className: "py-2" },
@@ -193,7 +234,9 @@
               : h("ul", { className: "divide-y" },
                   secrets.map((s) =>
                     h("li", { key: s.name, className: "flex items-center justify-between py-2" },
-                      h("code", { className: "text-sm font-mono" }, s.name),
+                      // explicit foreground color — dashboard `code` styling is a
+                      // multi-color gradient which is unreadable as a list label
+                      h("code", { className: "text-sm font-mono text-foreground", style: { color: "var(--foreground)" } }, s.name),
                       h("div", { className: "flex items-center gap-2" },
                         s.has_notes && h(Badge, { variant: "outline", key: "n" }, "notes"),
                         h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));

@@ -42,6 +42,36 @@ _BW = shutil.which("bw")
 _CA_CERT = Path.home() / "vw-certs" / "ca.crt"
 
 
+def _ensure_bw_server(env: dict) -> None:
+    """Point `bw` at secrets.dropvault.server_url when configured and different.
+
+    Lets the dashboard talk to any reachable Vaultwarden/Bitwarden — not
+    just the bundled local one. Best-effort: real errors surface from bw.
+    """
+    import yaml
+    try:
+        data = yaml.safe_load((Path.home() / ".hermes" / "config.yaml").read_text()) or {}
+        url = (((data.get("secrets") or {}).get("dropvault") or {}).get("server_url") or "").strip()
+    except Exception:
+        return
+    if not url:
+        return
+    try:
+        st = subprocess.run(["bw", "status"], env=env,
+                            capture_output=True, text=True, timeout=30)
+        cur = ""
+        try:
+            cur = json.loads(st.stdout).get("serverUrl") or ""
+        except Exception:
+            pass
+        if cur.rstrip("/") == url.rstrip("/"):
+            return
+        subprocess.run(["bw", "config", "server", url], env=env,
+                       capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
 def _bw_env(session: str = "") -> dict:
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -164,18 +194,57 @@ def upsert_secret(body: SecretBody):
 
 @router.post("/unlock")
 def unlock(body: UnlockBody):
-    """`bw unlock` with the posted password; persist BW_SESSION for Hermes.
+    """`bw login` (if needed) then `bw unlock` with the posted password.
 
-    The password reaches bw via the BW_PASSWORD env var (--passwordenv), so
-    it never appears in argv (invisible to `ps`) and never in logs.
+    After "Deauthorize Sessions" the CLI loses its stored auth token, so
+    unlock alone fails with "You are not logged in" — retry as a full
+    password login in that case. The password reaches bw via the BW_PASSWORD
+    env var (--passwordenv), so it never appears in argv (invisible to `ps`)
+    and never in logs.
     """
     if not _BW:
         raise HTTPException(503, "bw CLI not installed")
+    env = {**_bw_env(), "BW_PASSWORD": body.password}
+    # decoupling: honor a custom Vaultwarden URL (any reachable server)
+    _ensure_bw_server(env)
     proc = subprocess.run(
         ["bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD"],
-        env={**_bw_env(), "BW_PASSWORD": body.password},
-        capture_output=True, text=True, timeout=90,
+        env=env, capture_output=True, text=True, timeout=90,
     )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        if "not logged in" in (proc.stderr + proc.stdout).lower():
+            # full login (stores client auth), then unlock for the session key.
+            # bw login needs the email: last-known from bw status, else the
+            # dropvault account configured under secrets.dropvault.email.
+            st = subprocess.run(["bw", "status"], env=_bw_env(),
+                                capture_output=True, text=True, timeout=30)
+            try:
+                email = json.loads(st.stdout).get("userEmail")
+            except Exception:
+                email = None
+            if not email:
+                import yaml
+                cfg_path = Path.home() / ".hermes" / "config.yaml"
+                try:
+                    dv_cfg = (yaml.safe_load(cfg_path.read_text())
+                              .get("secrets", {}).get("dropvault", {}))
+                    email = dv_cfg.get("email")
+                except Exception:
+                    email = None
+            if not email:
+                raise HTTPException(
+                    409, "no known account email — set secrets.dropvault.email in config.yaml")
+            proc = subprocess.run(
+                ["bw", "login", email, "--raw", "--passwordenv", "BW_PASSWORD"],
+                env=env, capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode != 0 or not proc.stdout.strip():
+                detail = proc.stderr.strip()[:200] or "login failed"
+                raise HTTPException(401, detail)
+            proc = subprocess.run(
+                ["bw", "unlock", "--raw", "--passwordenv", "BW_PASSWORD"],
+                env=env, capture_output=True, text=True, timeout=90,
+            )
     if proc.returncode != 0 or not proc.stdout.strip():
         detail = proc.stderr.strip()[:200] or "unlock failed"
         raise HTTPException(401, detail)
