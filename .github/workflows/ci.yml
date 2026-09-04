@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install cryptography pyyaml requests
+
+      - name: Syntax + import checks
+        run: |
+          python -m py_compile tools/register_account.py dashboard/plugin_api.py
+          python - <<'EOF'
+          import ast, pathlib
+          for f in ["tools/register_account.py", "dashboard/plugin_api.py"]:
+              ast.parse(pathlib.Path(f).read_text())
+          print("parse OK")
+          EOF
+
+      - name: JS syntax check
+        run: node --check dashboard/dist/index.js
+
+      - name: Crypto unit checks (register_account helpers)
+        run: |
+          python - <<'EOF'
+          import importlib.util, base64, hashlib, hmac
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location(
+              "reg", "tools/register_account.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+
+          pw = b"correct horse battery staple"
+          mk = m.master_key(pw, "user@example.com")
+          assert len(mk) == 32
+
+          sk = m.stretched(mk)
+          assert len(sk) == 64
+
+          # EncString type 2 round-trip: enc(sk[:32], sk[32:], pt) decrypts back
+          blob = m.encrypt_with_keys(sk[:32], sk[32:], b"hello world")
+          t, rest = blob.split(".", 1)
+          assert t == "2"
+          iv, ct, mac = (base64.b64decode(x) for x in rest.split("|"))
+          assert hmac.new(sk[32:], iv + ct, hashlib.sha256).digest() == mac
+          print("crypto round-trips OK")
+          EOF
+
+      - name: Manifest sanity
+        run: |
+          python - <<'EOF'
+          import json, re, pathlib
+          m = json.loads(pathlib.Path("dashboard/manifest.json").read_text())
+          assert m["name"] == "dropvault"
+          assert m["api"] == "plugin_api.py"
+          y = pathlib.Path("plugin.yaml").read_text()
+          assert "name: dropvault" in y
+          print("manifests OK")
+          EOF

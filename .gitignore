@@ -1,0 +1,10 @@
+# never commit secrets or vault data
+.env
+data/
+*.pw
+*master*
+out/
+*.key
+__pycache__/
+*.pyc
+.DS_Store

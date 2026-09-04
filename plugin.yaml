@@ -1,0 +1,9 @@
+name: dropvault
+version: "0.1.0"
+description: "Vaultwarden-backed secret source + dashboard drop-in UI. Drop secrets into a local vault without SSH and without values entering LLM context."
+author: red4711
+requires_env: []
+optional_env:
+  - BW_SESSION
+provides_tools: []
+provides_hooks: []

@@ -1,0 +1,13 @@
+{
+  "name": "dropvault",
+  "label": "Dropvault",
+  "description": "Secret drop-in: add or update secrets in the local Vaultwarden without SSH and without values entering LLM context.",
+  "icon": "Shield",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/dropvault",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
