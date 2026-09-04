@@ -17,12 +17,8 @@
   const h = React.createElement;
   const {
     Card, CardContent,
-    Badge, Button, Input, Label, Textarea,
-  } = Object.assign(
-    {},
-    SDK.components,
-    { Textarea: SDK.components.Textarea || "textarea" }
-  );
+    Badge, Button, Input, Label,
+  } = SDK.components;
   const { useState, useEffect, useCallback } = SDK.hooks;
   const { cn } = SDK.utils;
 
@@ -62,7 +58,6 @@
     const [pw, setPw] = useState("");
     const [name, setName] = useState("");
     const [value, setValue] = useState("");
-    const [notes, setNotes] = useState("");
     const [busy, setBusy] = useState(false);
     const [unlocking, setUnlocking] = useState(false);
     const [showForm, setShowForm] = useState(false);
@@ -119,11 +114,11 @@
     }
 
     function openNew() {
-      setEditName(null); setName(""); setValue(""); setNotes("");
+      setEditName(null); setName(""); setValue("");
       setShowForm(true);
     }
     function openEdit(n) {
-      setEditName(n); setName(n); setValue(""); setNotes("");
+      setEditName(n); setName(n); setValue("");
       setShowForm(true);
     }
 
@@ -133,12 +128,12 @@
       try {
         const r = await api("/secrets", {
           method: "POST",
-          body: JSON.stringify({ name, value, notes: notes || null }),
+          body: JSON.stringify({ name, value }),
         });
         setNotice(r.created
           ? `Created ${r.name}.`
           : `Updated ${r.name}.`);
-        setValue(""); setNotes(""); setShowForm(false);
+        setValue(""); setShowForm(false);
         await refresh();
       } catch (e2) {
         setError(e2.message);
@@ -214,9 +209,6 @@
                 h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
                 h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
                            placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
-              h("div", null,
-                h(Label, null, "Notes (optional, stored as item notes — not secret)"),
-                h(Textarea, { rows: 2, value: notes, onChange: (e) => setNotes(e.target.value) })),
               h("div", { className: "flex gap-2 justify-end" },
                 h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
                 h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
@@ -238,7 +230,6 @@
                       // gradient; render names as normal text
                       h("span", { className: "text-sm" }, s.name),
                       h("div", { className: "flex items-center gap-2" },
-                        s.has_notes && h(Badge, { variant: "outline", key: "n" }, "notes"),
                         h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));
   }
 
