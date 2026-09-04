@@ -55,13 +55,21 @@ def parse_env(path: Path):
 
 
 def encode_item(name, value, folder_id, item_id=None):
+    """Encrypted-envelope input for `bw create/edit item`.
+
+    IMPORTANT: bw's argument is base64(whole item JSON) — only the OUTER
+    encoding. Field values inside (name, password) stay PLAINTEXT; the
+    CLI encrypts them. Pre-encoding individual fields (an earlier bug)
+    stored literal base64 strings in the vault, visible as gibberish in
+    the web vault UI.
+    """
     data = {
         "type": 1,
-        "name": base64.b64encode(name.encode()).decode(),
+        "name": name,
         "notes": None,
         "login": {
             "username": None,
-            "password": base64.b64encode(value.encode()).decode(),
+            "password": value,
             "totp": None,
         },
         "folderId": folder_id if item_id is None else None,
@@ -122,7 +130,7 @@ def main():
         try:
             if name in existing:
                 item = bw_json(["get", "item", existing[name]], session)
-                item["login"]["password"] = base64.b64encode(value.encode()).decode()
+                item["login"]["password"] = value
                 enc = base64.b64encode(json.dumps(item).encode()).decode()
                 subprocess.run([BW, "edit", "item", existing[name], enc],
                                env=bw_env(session),
