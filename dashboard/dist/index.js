@@ -212,8 +212,8 @@
                            placeholder: "OPENROUTER_API_KEY", disabled: !!editName, autoFocus: true })),
               h("div", null,
                 h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
-                h(Input, { type: "password", value: value, onChange: (e) => setValue(e.target.value),
-                           placeholder: editName ? "•••••• (unchanged)" : "secret value" })),
+                h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
+                           placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
               h("div", null,
                 h(Label, null, "Notes (optional, stored as item notes — not secret)"),
                 h(Textarea, { rows: 2, value: notes, onChange: (e) => setNotes(e.target.value) })),
@@ -234,9 +234,9 @@
               : h("ul", { className: "divide-y" },
                   secrets.map((s) =>
                     h("li", { key: s.name, className: "flex items-center justify-between py-2" },
-                      // explicit foreground color — dashboard `code` styling is a
-                      // multi-color gradient which is unreadable as a list label
-                      h("code", { className: "text-sm font-mono text-foreground", style: { color: "var(--foreground)" } }, s.name),
+                      // plain text — the dashboard's <code> styling is a multi-color
+                      // gradient; render names as normal text
+                      h("span", { className: "text-sm" }, s.name),
                       h("div", { className: "flex items-center gap-2" },
                         s.has_notes && h(Badge, { variant: "outline", key: "n" }, "notes"),
                         h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));
