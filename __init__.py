@@ -57,13 +57,23 @@ class VwVaultSource(SecretSource):
         ca = self._cfg_get(cfg, "ca_cert", None)
         if ca:
             extra["NODE_EXTRA_CA_CERTS"] = str(ca)
+        # bw is a node script with #!/usr/bin/env node; sanitized child envs may
+        # lack the dir holding node. Resolve it once and prepend to PATH.
+        import shutil, os as _os
+        node = shutil.which("node") or (
+            _os.path.expanduser("~/.local/bin/node")
+            if _os.path.isfile(_os.path.expanduser("~/.local/bin/node")) else None
+        )
+        if node:
+            extra["PATH"] = _os.path.dirname(node) + ":" + _os.environ.get("PATH", "/usr/bin:/bin")
         return extra
 
     def _bw_json(self, argv, session: str, timeout: float, cfg: dict = None):
         """Run bw with the session env, parse JSON stdout. RuntimeError on
         spawn problems per run_secret_cli contract; returns (proc, parsed)."""
+        cli = getattr(self, "_cli", None) or self._resolve_cli(cfg or {})
         proc = run_secret_cli(
-            ["bw", *argv],
+            [cli, *argv],
             allow_env=["BW_SESSION", "NODE_EXTRA_CA_CERTS"],
             extra_env=self._bw_env(session, cfg or {}),
             timeout=timeout,
@@ -75,6 +85,37 @@ class VwVaultSource(SecretSource):
     # ------------------------------------------------------------------ #
     # SecretSource contract
     # ------------------------------------------------------------------ #
+
+    def _resolve_cli(self, cfg: dict):
+        """Find bw: explicit cfg path > PATH > common install locations."""
+        import os, shutil
+        cand = cfg.get("cli_path")
+        if cand and os.path.isfile(cand):
+            return cand
+        w = shutil.which("bw")
+        if w:
+            return w
+        for c in (
+            os.path.expanduser("~/.local/bin/bw"),
+            "/usr/local/bin/bw",
+            "/usr/bin/bw",
+        ):
+            if os.path.isfile(c):
+                return c
+        return None
+
+    @staticmethod
+    def _maybe_b64_decode(s: str) -> str:
+        """bw's item JSON carries pre-encoded fields; decode if it is valid b64."""
+        import base64 as _b64
+        if not s or "=" in s and s.count("=") > 2:
+            return s
+        try:
+            dec = _b64.b64decode(s, validate=True)
+            txt = dec.decode("utf-8")
+            return txt if txt.isprintable() else s
+        except Exception:
+            return s
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
         result = FetchResult()
@@ -88,7 +129,9 @@ class VwVaultSource(SecretSource):
             result.error_kind = ErrorKind.NOT_CONFIGURED
             return result
 
-        if shutil.which("bw") is None:
+        cli = self._resolve_cli(cfg or {})
+        self._cli = cli
+        if cli is None:
             result.error = "The `bw` CLI is not installed or not on PATH."
             result.error_kind = ErrorKind.BINARY_MISSING
             return result
@@ -120,10 +163,12 @@ class VwVaultSource(SecretSource):
             _, items = self._bw_json(["list", "items", "--folderid", folder_id], session, timeout * 2, cfg)
             secrets: Dict[str, str] = {}
             for item in items:
-                name = (item.get("name") or "").strip()
+                name = self._maybe_b64_decode((item.get("name") or "").strip())
                 value = (item.get("login") or {}).get("password")
                 if value is None:
                     value = item.get("notes") or ""
+                else:
+                    value = self._maybe_b64_decode(value)
                 if not name:
                     continue
                 if not value:
