@@ -155,6 +155,13 @@ hermes  →  os.environ["MY_API_KEY"]   # value came from the vault, never from 
 - **Master password handling.** The unlock route forwards the posted
   password to `bw` via the `BW_PASSWORD` environment variable
   (`--passwordenv`), so it never appears in `ps` output, argv, or logs.
+- **Two-step login.** Accounts with 2FA: first unlock attempt returns
+  402 with the CLI-supported methods (authenticator 0, email 1, YubiKey
+  OTP 3 — Duo/FIDO2 are NOT supported by `bw`); the UI reveals a
+  method + code field and retries. The TOTP/email code travels in argv
+  (`bw` offers no `--codeenv`), expires in ~30s, and is never logged.
+  Email codes are delivered by the server after the first attempt —
+  check inbox, then Verify & unlock.
 - **At rest.** Secrets live encrypted in Vaultwarden (the same encryption
   bw clients use). The only on-disk plaintext-capable artifacts are the
   per-vault session keys in `~/.hermes/.env` (`BW_SESSION` for `default`,
