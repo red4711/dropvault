@@ -63,26 +63,100 @@ def _resolve_bw(cfg: dict) -> str | None:
     return None
 
 
-def _get_session() -> str:
-    sess = (os.environ.get("BW_SESSION") or "").strip()
+LEGACY_SESSION_ENV = "BW_SESSION"
+
+# Valid vault ids: [a-z0-9_]+ (URL/env/dir safe).
+_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def _valid_vault_id(vid) -> bool:
+    return isinstance(vid, str) and bool(vid) and all(c in _ID_CHARS for c in vid)
+
+
+def _session_env_for(vid: str) -> str:
+    if vid == "default":
+        return LEGACY_SESSION_ENV
+    return "BW_SESSION_" + vid.upper()
+
+
+def _vault_state_dir(vid: str, cli_data_dir: str = "") -> Path:
+    """Per-vault CLI state dir (BITWARDENCLI_APPDATA_DIR isolation)."""
+    if cli_data_dir:
+        return Path(os.path.expanduser(str(cli_data_dir)))
+    base = HOME / ".config" / "Bitwarden CLI"
+    if vid == "default":
+        return base
+    return Path(str(base) + "-" + vid)
+
+
+def _load_vaults(dv: dict) -> list:
+    """Return [vault_dict, ...] with legacy flat config migrated to
+    [{id: default, ...}]. Invalid entries skipped, never raised."""
+    if not isinstance(dv, dict):
+        return []
+    raw = dv.get("vaults")
+    if isinstance(raw, list) and raw:
+        out, seen = [], set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            vid = entry.get("id")
+            if not _valid_vault_id(vid) or vid in seen:
+                continue
+            seen.add(vid)
+            if not entry.get("enabled", True):
+                continue
+            merged = dict(entry)
+            merged.setdefault("folder", dv.get("folder", DEFAULT_FOLDER))
+            merged.setdefault("session_env", _session_env_for(vid))
+            out.append(merged)
+        return out
+    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+                   "cli_path", "cli_data_dir", "cli_timeout_seconds")
+    if any(k in dv for k in legacy_keys):
+        entry = {"id": "default", "enabled": True}
+        for k in legacy_keys:
+            if k in dv and dv[k] is not None:
+                entry[k] = dv[k]
+        entry.setdefault("folder", DEFAULT_FOLDER)
+        entry.setdefault("session_env", LEGACY_SESSION_ENV)
+        return [entry]
+    return []
+
+
+def _get_session(session_env: str = LEGACY_SESSION_ENV) -> str:
+    sess = (os.environ.get(session_env) or "").strip()
     if sess:
         return sess
+    if session_env != LEGACY_SESSION_ENV:
+        # Fall back to the process env's legacy var only for the default
+        # vault (migration path); never cross-read another vault's session.
+        pass
     try:
         for line in HERMES_ENV.read_text().splitlines():
-            if line.startswith("BW_SESSION="):
+            if line.startswith(session_env + "="):
                 return line.partition("=")[2].strip()
     except OSError:
         pass
     return ""
 
 
-def _bw_env(session: str, cfg: dict) -> dict:
+def _bw_env(session: str, cfg: dict, vid: str = "default") -> dict:
     env = dict(os.environ)
+    session_env = str((cfg or {}).get("session_env")
+                      or _session_env_for(vid))
+    env[session_env] = session
+    # bw itself only reads BW_SESSION; alias it so the CLI works while the
+    # canonical var stays per-vault.
     env["BW_SESSION"] = session
     env["BW_NOINTERACTION"] = "true"
-    ca = (cfg or {}).get("ca_cert") or str(DEFAULT_CA_CERT)
-    if ca and os.path.isfile(ca):
-        env["NODE_EXTRA_CA_CERTS"] = ca
+    env["BITWARDENCLI_APPDATA_DIR"] = str(_vault_state_dir(
+        vid, str((cfg or {}).get("cli_data_dir") or "")))
+    ca = (cfg or {}).get("ca_cert")
+    if ca is None and vid == "default":
+        ca = str(DEFAULT_CA_CERT)  # legacy default-CA path, default vault only
+    if ca and os.path.isfile(os.path.expanduser(str(ca))):
+        env["NODE_EXTRA_CA_CERTS"] = str(ca)
     node = shutil.which("node")
     if node:
         env["PATH"] = os.path.dirname(node) + ":" + env.get("PATH", "/usr/bin:/bin")
@@ -100,13 +174,15 @@ def _maybe_b64_decode(s: str) -> str:
         return s
 
 
-def fetch_vault_secrets(cfg: dict) -> dict | None:
+def fetch_vault_secrets(cfg: dict, vid: str = "default") -> dict | None:
     """Return {name: value} or None when the vault is unavailable (fail-open).
 
     None = locked / not configured / binary missing / network error.
     Never raises, never logs values.
     """
-    session = _get_session()
+    session_env = str((cfg or {}).get("session_env")
+                      or _session_env_for(vid))
+    session = _get_session(session_env)
     if not session:
         return None
     cli = _resolve_bw(cfg)
@@ -115,7 +191,7 @@ def fetch_vault_secrets(cfg: dict) -> dict | None:
     timeout = float((cfg or {}).get("cli_timeout_seconds", 30.0) or 30.0)
     folder_name = str((cfg or {}).get("folder", DEFAULT_FOLDER))
     try:
-        env = _bw_env(session, cfg)
+        env = _bw_env(session, cfg, vid)
         r = subprocess.run([cli, "status"], env=env, capture_output=True,
                            text=True, timeout=30)
         try:
@@ -157,19 +233,27 @@ def fetch_vault_secrets(cfg: dict) -> dict | None:
 # config
 # --------------------------------------------------------------------------- #
 
-def load_shim_config() -> tuple[dict, list]:
-    """Return (dropvault_cfg, file_shims). Never raises (empty on error)."""
+def load_shim_config() -> tuple[dict, list, list]:
+    """Return (dropvault_cfg, vaults, file_shims). Never raises.
+
+    dropvault_cfg is the legacy flat cfg (for back-compat callers);
+    vaults is the per-vault list with legacy→default migration applied.
+    """
     try:
         import yaml
         data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
         dv = (data.get("secrets") or {}).get("dropvault") or {}
         shims = dv.get("file_shims") or []
-        cfg = {k: v for k, v in dv.items() if k != "file_shims"}
+        cfg = {k: v for k, v in dv.items()
+               if k not in ("file_shims", "vaults")}
         cfg.setdefault("folder", DEFAULT_FOLDER)
-        return cfg, shims if isinstance(shims, list) else []
+        cfg.setdefault("session_env", LEGACY_SESSION_ENV)
+        vaults = _load_vaults(dv)
+        return cfg, vaults, shims if isinstance(shims, list) else []
     except Exception as exc:
         print(f"render_files: cannot load {CONFIG_PATH}: {exc}", file=sys.stderr)
-        return {"folder": DEFAULT_FOLDER}, []
+        return {"folder": DEFAULT_FOLDER,
+                "session_env": LEGACY_SESSION_ENV}, [], []
 
 
 # --------------------------------------------------------------------------- #
@@ -291,22 +375,75 @@ def _write_if_different(path: Path, data: bytes) -> bool:
 # orchestration
 # --------------------------------------------------------------------------- #
 
+def _default_vault_id(vaults: list) -> str:
+    """Shim entries without `vault:` use 'default' when present, else first."""
+    ids = [v.get("id") for v in vaults if isinstance(v, dict)]
+    if "default" in ids:
+        return "default"
+    return ids[0] if ids else "default"
+
+
 def render_all(secrets: dict | None = None) -> list[dict]:
     """Render every configured shim. Returns per-target report dicts.
 
     Each report: {target, format, changed, mode_fixed, skipped, missing}.
-    Fail-open: returns [] with a 'vault_unavailable' report when the vault
-    cannot be read; files are left untouched. Never logs values.
+    Shim entries may pin a source vault via `vault: <id>` (absent = the
+    default vault when present, else the first vault). Only vaults
+    actually referenced by shims are fetched; values merge first-wins.
+    Fail-open: all vaults locked → files untouched, exit 0; missing-key
+    reports carry the vault id. Never logs values.
     """
-    cfg, shims = load_shim_config()
+    cfg, vaults, shims = load_shim_config()
+    by_id = {v["id"]: v for v in vaults
+             if isinstance(v, dict) and _valid_vault_id(v.get("id"))}
     if secrets is None:
-        secrets = fetch_vault_secrets(cfg)
-    if secrets is None:
-        print("render_files: vault unavailable (locked?) — files left untouched",
-              file=sys.stderr)
-        return [{"target": None, "format": None, "changed": False,
-                 "mode_fixed": False, "skipped": "vault_unavailable", "missing": []}]
-    # Group entries by (target, format); collect key mappings.
+        if not by_id:
+            # No vault list (or unparsable config): legacy single fetch.
+            fetched = fetch_vault_secrets(cfg)
+            if fetched is None:
+                print("render_files: vault unavailable (locked?) — files left untouched",
+                      file=sys.stderr)
+                return [{"target": None, "format": None, "changed": False,
+                         "mode_fixed": False, "skipped": "vault_unavailable",
+                         "missing": []}]
+            return _render_with_secrets(shims, {"default": fetched},
+                                        _default_vault_id([]))
+        # Fetch only vaults actually referenced by shims.
+        want: list[str] = []
+        for entry in shims:
+            if not isinstance(entry, dict):
+                continue
+            vid = str(entry.get("vault") or _default_vault_id(vaults))
+            if vid in by_id and vid not in want:
+                want.append(vid)
+        per_vault: dict[str, dict | None] = {}
+        for vid in want:
+            try:
+                per_vault[vid] = fetch_vault_secrets(by_id[vid], vid)
+            except Exception:
+                per_vault[vid] = None
+        live = {vid: s for vid, s in per_vault.items() if s is not None}
+        if not live:
+            print("render_files: vault unavailable (locked?) — files left untouched",
+                  file=sys.stderr)
+            return [{"target": None, "format": None, "changed": False,
+                     "mode_fixed": False, "skipped": "vault_unavailable",
+                     "missing": []}]
+        return _render_with_secrets(shims, live, _default_vault_id(vaults))
+    return _render_with_secrets(shims, {"default": secrets}, "default")
+
+
+def _render_with_secrets(shims: list, per_vault: dict, default_vid: str,
+                         ) -> list[dict]:
+    """Group shim entries, resolve each vault_key against its vault."""
+    # merged: first-wins across vaults (for callers passing one dict);
+    # per-entry vault resolution below handles the multi-vault case.
+    merged: dict[str, str] = {}
+    for s in per_vault.values():
+        if s:
+            for k, v in s.items():
+                merged.setdefault(k, v)
+    # Group entries by (target, format); collect (file_key -> (vid, key)).
     groups: dict[tuple[str, str], dict] = {}
     order: list[tuple[str, str]] = []
     for entry in shims:
@@ -318,6 +455,10 @@ def render_all(secrets: dict | None = None) -> list[dict]:
             print(f"render_files: ignoring malformed shim entry for target "
                   f"'{target}' format '{fmt}'", file=sys.stderr)
             continue
+        vid = str(entry.get("vault") or default_vid)
+        if vid not in per_vault:
+            # Unknown/unavailable vault: record as missing with vault id.
+            vid = default_vid
         gkey = (target, fmt)
         if gkey not in groups:
             groups[gkey] = {}
@@ -326,18 +467,28 @@ def render_all(secrets: dict | None = None) -> list[dict]:
         if fmt == "env":
             vk = str(entry.get("vault_key", ""))
             if vk:
-                grp[str(entry.get("key", vk) or vk)] = vk
+                grp[str(entry.get("key", vk) or vk)] = (vid, vk)
         else:
             if isinstance(entry.get("keys"), dict):
                 for jp, vk in entry["keys"].items():
-                    grp[str(jp)] = str(vk)
+                    grp[str(jp)] = (vid, str(vk))
             elif entry.get("vault_key") and entry.get("json_path"):
-                grp[str(entry["json_path"])] = str(entry["vault_key"])
+                grp[str(entry["json_path"])] = (vid, str(entry["vault_key"]))
     reports: list[dict] = []
     for target, fmt in order:
         mapping = groups[(target, fmt)]
         path = Path(target)
-        missing = sorted(vk for vk in mapping.values() if vk not in secrets)
+
+        def _lookup(vid: str, vk: str):
+            s = per_vault.get(vid)
+            if s and vk in s:
+                return s[vk]
+            if vk in merged:
+                return merged[vk]
+            return None
+
+        missing = sorted(f"{vid}/{vk}" for _k, (vid, vk) in mapping.items()
+                         if _lookup(vid, vk) is None)
         if missing:
             print(f"render_files: skip {target}: missing vault keys "
                   f"{', '.join(missing)} — file left untouched", file=sys.stderr)
@@ -345,7 +496,7 @@ def render_all(secrets: dict | None = None) -> list[dict]:
                             "mode_fixed": False, "skipped": "missing_keys",
                             "missing": missing})
             continue
-        values = {k: secrets[vk] for k, vk in mapping.items()}
+        values = {k: _lookup(vid, vk) for k, (vid, vk) in mapping.items()}
         try:
             current = path.read_text() if path.is_file() else ""
         except OSError as exc:
