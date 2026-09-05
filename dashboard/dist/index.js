@@ -120,6 +120,23 @@
     const [mBusy, setMBusy] = useState(false);
     const [mError, setMError] = useState(null);
     const [confirmRemove, setConfirmRemove] = useState(null); // vault id | null
+    // Collapsed vault cards, keyed by id. Persisted to localStorage so the
+    // layout survives reloads.
+    const [collapsedBy, setCollapsedBy] = useState(() => {
+      try {
+        const raw = (typeof localStorage !== "undefined" && localStorage.getItem("dropvault.collapsed")) || "{}";
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch (e) { return {}; }
+    });
+    function setCollapsed(id, val) {
+      setCollapsedBy((m) => {
+        const next = Object.assign({}, m);
+        if (val) next[id] = true; else delete next[id];
+        try { if (typeof localStorage !== "undefined") localStorage.setItem("dropvault.collapsed", JSON.stringify(next)); } catch (e) {}
+        return next;
+      });
+    }
 
     const legacy = vaults !== null && vaults.length === 0;
     const multi = !legacy && vaults !== null && vaults.length > 1;
@@ -270,6 +287,8 @@
         }
         void resp;
         setPw(""); setTfa(null);
+        // Reveal the vault contents after a successful unlock.
+        try { if (vid) setCollapsed(vid, false); } catch (e3) {}
         await refreshOne(vid);
         await refreshVaults().catch(() => {});
       } catch (e2) {
@@ -501,11 +520,15 @@
     // One self-contained vault section: identity, unlock form, actions,
     // and secrets all live inside this card, so Lock/Sync/secrets are
     // visually grouped with the vault they belong to. In multi mode the
-    // tab strip above switches which vault is shown.
+    // tab strip above switches which vault is shown. Collapsible: the
+    // identity row + connection line always show; everything below hides
+    // when collapsed (persisted per vault id across reloads).
     function VaultCard() {
       const meta = legacy ? null : selMeta;
       const st = status;
       if (!meta && !st) return null;
+      const cardId = meta ? meta.id : "legacy";
+      const collapsed = !!collapsedBy[cardId];
       const label = meta ? (meta.label || meta.id) : "Vault";
       const enabled = !meta || meta.enabled !== false;
       const email = (meta && meta.email) || (st && st.email);
@@ -515,29 +538,44 @@
       const ok = live ? !!live.ok : (st ? !!st.ok : !!((meta && meta.ok)));
       const state = (st && st.vault) || (meta && meta.vault) || (ok ? "unlocked" : "locked");
       const nb = "whitespace-nowrap";
+      const chev = h(Button, {
+        key: "chev", variant: "ghost", size: "sm",
+        onClick: () => setCollapsed(cardId, !collapsed),
+        className: "h-7 w-7 px-0",
+        title: collapsed ? "Expand vault" : "Collapse vault",
+        "aria-expanded": collapsed ? "false" : "true",
+        "aria-label": collapsed ? "Expand vault" : "Collapse vault",
+      }, h("span", {
+        className: "inline-block transition-transform " + (collapsed ? "" : "rotate-90"),
+        "aria-hidden": "true",
+      }, "›"));
+      const head = h("div", { className: "flex items-center gap-2 flex-wrap" },
+        chev,
+        h(LockDot, { ok }),
+        h("span", { className: "font-medium" }, label),
+        ok ? h(Badge, { key: "b" }, "unlocked")
+           : h(Badge, { key: "b", variant: "destructive" }, state),
+        !enabled && h(Badge, { key: "d", variant: "outline" }, "disabled"),
+        h("span", { className: "flex-1", key: "sp" }),
+        meta && h(Button, {
+          key: "edit", variant: "ghost", size: "sm",
+          onClick: () => openEditVault(meta), disabled: busy,
+          className: "h-7 px-2 text-xs whitespace-nowrap",
+        }, "Edit"),
+        meta && h(Button, {
+          key: "toggle", variant: "ghost", size: "sm",
+          onClick: () => doToggleVault(meta), disabled: busy,
+          className: "h-7 px-2 text-xs whitespace-nowrap",
+          title: enabled ? "Stop pulling secrets from this vault" : "Resume pulling secrets from this vault",
+        }, enabled ? "Disable" : "Enable"));
+      const conn = (email || server) && h("p", { key: "conn", className: "text-sm text-muted-foreground" },
+        [email, server].filter(Boolean).join(" · "));
+      if (collapsed) {
+        return h(Card, { key: "vcard" },
+          h(CardContent, { className: "py-4 space-y-2" }, head, conn));
+      }
       return h(Card, { key: "vcard" },
-        h(CardContent, { className: "py-4 space-y-4" },
-          // identity row
-          h("div", { className: "flex items-center gap-2 flex-wrap" },
-            h(LockDot, { ok }),
-            h("span", { className: "font-medium" }, label),
-            ok ? h(Badge, { key: "b" }, "unlocked")
-               : h(Badge, { key: "b", variant: "destructive" }, state),
-            !enabled && h(Badge, { key: "d", variant: "outline" }, "disabled"),
-            h("span", { className: "flex-1", key: "sp" }),
-            meta && h(Button, {
-              key: "edit", variant: "ghost", size: "sm",
-              onClick: () => openEditVault(meta), disabled: busy,
-              className: "h-7 px-2 text-xs whitespace-nowrap",
-            }, "Edit"),
-            meta && h(Button, {
-              key: "toggle", variant: "ghost", size: "sm",
-              onClick: () => doToggleVault(meta), disabled: busy,
-              className: "h-7 px-2 text-xs whitespace-nowrap",
-              title: enabled ? "Stop pulling secrets from this vault" : "Resume pulling secrets from this vault",
-            }, enabled ? "Disable" : "Enable")),
-          (email || server) && h("p", { key: "conn", className: "text-sm text-muted-foreground" },
-            [email, server].filter(Boolean).join(" · ")),
+        h(CardContent, { className: "py-4 space-y-4" }, head, conn,
           // unlock form (this vault only)
           st && !st.ok && h("form", { key: "unlock", onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
             h("div", { className: "flex-1 space-y-3 min-w-52" },
