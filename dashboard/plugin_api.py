@@ -41,7 +41,39 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+try:
+    from vault_handle import (
+        TWO_FACTOR_METHODS,
+        is_two_factor_challenge,
+        login_argv,
+    )
+except ImportError:
+    # The dashboard loads this file standalone (module
+    # hermes_dashboard_plugin_dropvault) with the plugin root NOT on
+    # sys.path — add it so the 2FA helpers stay single-sourced.
+    import sys as _sys
+
+    _ROOT = Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(_ROOT))
+    from vault_handle import (  # noqa: E402
+        TWO_FACTOR_METHODS,
+        is_two_factor_challenge,
+        login_argv,
+    )
+
 log = logging.getLogger(__name__)
+
+# What "CLI lost its auth token" looks like (matched case-insensitively
+# against bw's stderr+stdout). The login branch must ONLY fire on these —
+# never on a bad master password, where `bw unlock` fails with a
+# decryption error and retrying `bw login` would CLOBBER the working
+# state dir's auth token with a failed-login attempt.
+_NOT_LOGGED_IN_MARKERS = (
+    "not logged in",
+    "no active account",
+    "not authenticated",
+)
 
 router = APIRouter()
 
@@ -321,6 +353,11 @@ def _vault_summary(cfg: dict) -> dict:
 class UnlockBody(BaseModel):
     password: str
     vault: Optional[str] = None
+    # Two-step login (only needed when the account has 2FA enabled):
+    # authenticator/email TOTP or email code. Duo/FIDO2 are NOT supported
+    # by the `bw` CLI — use an authenticator, email, or YubiKey OTP method.
+    method: Optional[int] = None
+    code: Optional[str] = None
 
 
 class SecretBody(BaseModel):
@@ -448,6 +485,12 @@ def unlock(body: UnlockBody):
     password login in that case. The password reaches bw via the BW_PASSWORD
     env var (--passwordenv), so it never appears in argv (invisible to `ps`)
     and never in logs. Scoped to one vault: its state dir, server, email.
+
+    Two-step login: accounts with 2FA get a 402 response
+    ({detail: "two-factor required", methods}) listing this vault's
+    CLI-supported methods — the UI then shows a code field and retries
+    with {password, method, code}. The TOTP/email code travels in argv
+    (bw offers no --codeenv); it expires in ~30s and is never logged.
     """
     cfg = _vault_cfg(body.vault)
     if _resolve_cli(cfg) is None:
@@ -461,7 +504,8 @@ def unlock(body: UnlockBody):
         env=env, capture_output=True, text=True, timeout=90,
     )
     if proc.returncode != 0 or not proc.stdout.strip():
-        if "not logged in" in (proc.stderr + proc.stdout).lower():
+        combined_lower = (proc.stderr + proc.stdout).lower()
+        if any(m in combined_lower for m in _NOT_LOGGED_IN_MARKERS):
             # full login (stores client auth), then unlock for the session key.
             # bw login needs the email: last-known from bw status in this
             # vault's state dir, else this vault's configured email.
@@ -476,11 +520,34 @@ def unlock(body: UnlockBody):
             if not email:
                 raise HTTPException(
                     409, "no known account email — set secrets.dropvault.vaults[].email in config.yaml")
+            method = body.method
+            if method is not None and method not in TWO_FACTOR_METHODS:
+                raise HTTPException(
+                    422, f"unsupported two-step method {method} — "
+                    f"bw supports {sorted(TWO_FACTOR_METHODS)}")
             proc = subprocess.run(
-                [cli, "login", email, "--raw", "--passwordenv", "BW_PASSWORD"],
+                login_argv(cli, email, method=method,
+                           code=(body.code or None)),
                 env=env, capture_output=True, text=True, timeout=120,
             )
             if proc.returncode != 0 or not proc.stdout.strip():
+                combined = proc.stderr + proc.stdout
+                if is_two_factor_challenge(combined) and not body.code:
+                    # Account has 2FA: tell the UI to show the code field.
+                    # (Returned, not raised, so the methods list survives
+                    # as JSON — HTTPException would stringify detail.)
+                    from fastapi.responses import JSONResponse
+
+                    return JSONResponse(
+                        status_code=402,
+                        content={
+                            "detail": "two-factor required",
+                            "methods": [
+                                {"id": mid, "name": name}
+                                for mid, name in sorted(TWO_FACTOR_METHODS.items())
+                            ],
+                        },
+                    )
                 detail = proc.stderr.strip()[:200] or "login failed"
                 raise HTTPException(401, detail)
             proc = subprocess.run(

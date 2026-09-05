@@ -25,6 +25,30 @@ def valid_vault_id(vid: object) -> bool:
     return isinstance(vid, str) and bool(vid) and all(c in _ID_CHARS for c in vid)
 
 
+# Two-step login methods the `bw` CLI supports (bitwarden TwoFactorProviderType
+# subset — Duo/FIDO2-WebAuthn are NOT supported by the CLI and are excluded).
+TWO_FACTOR_METHODS = {0: "Authenticator", 1: "Email", 3: "YubiKey OTP"}
+
+
+def is_two_factor_challenge(output: str) -> bool:
+    """True when bw output shows the login stopped at the second factor."""
+    lowered = (output or "").lower()
+    return any(m in lowered for m in (
+        "code is required", "two-factor", "two factor",
+        "two-step", "two step", "no provider selected"))
+
+
+def login_argv(cli: str, email: str, method=None, code: str | None = None) -> list:
+    """`bw login` argv. Code travels in argv (bw offers no --codeenv);
+    TOTP codes expire in ~30s and are never logged."""
+    argv = [cli, "login", email, "--raw", "--passwordenv", "BW_PASSWORD"]
+    if method is not None:
+        argv += ["--method", str(method)]
+    if code:
+        argv += ["--code", code]
+    return argv
+
+
 def session_env_for(vid: str) -> str:
     """Per-vault session var; 'default' keeps the legacy BW_SESSION."""
     if vid == "default":

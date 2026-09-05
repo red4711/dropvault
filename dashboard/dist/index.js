@@ -92,6 +92,10 @@
     const [errorBy, setErrorBy] = useState({});
     const [noticeBy, setNoticeBy] = useState({});
     const [pwBy, setPwBy] = useState({});
+    // Two-step login state, per vault: null = no 2FA challenge pending,
+    // else {methods: [{id, name}], method: id|null, code: ""}.
+    const [tfaBy, setTfaBy] = useState({});
+    const [legacyTfa, setLegacyTfa] = useState(null);
     // Legacy single-vault state (used only when /vaults 404s).
     const [legacyStatus, setLegacyStatus] = useState(null);
     const [legacySecrets, setLegacySecrets] = useState(null);
@@ -122,6 +126,11 @@
     const setNotice = legacy
       ? setLegacyNotice
       : (v) => setNoticeBy((m) => Object.assign({}, m, { [sel]: v }));
+    // 2FA challenge for the selected vault (null = none pending).
+    const tfa = legacy ? legacyTfa : (sel ? tfaBy[sel] || null : null);
+    const setTfa = legacy
+      ? setLegacyTfa
+      : (v) => setTfaBy((m) => Object.assign({}, m, { [sel]: v }));
 
     // Effective vault id for API calls: null in legacy mode.
     const vid = legacy ? null : sel;
@@ -206,6 +215,8 @@
     function selectVault(id) {
       if (id === sel) return;
       // Reset shared form state so drafts never leak across vaults.
+      // (2FA challenges stay keyed per vault — switching away and back
+      // keeps the pending challenge, not the password.)
       setShowForm(false); setEditName(null); setName(""); setValue("");
       setUnlocking(false); setBusy(false);
       setSel(id);
@@ -213,12 +224,41 @@
       if (statusBy[id] === undefined) refreshOne(id);
     }
 
+    // Unlock, with auto-detect two-step login: first attempt is plain
+    // password; a 402 "two-factor required" response with the server's
+    // methods list flips the form into code-entry mode and the retry
+    // carries {password, method, code}.
     async function doUnlock(e) {
       e.preventDefault();
       setUnlocking(true); setError(null);
       try {
-        await apiPost("/unlock", vid, { password: pw });
-        setPw("");
+        const payload = { password: pw };
+        if (tfa && tfa.code) {
+          payload.code = tfa.code;
+          if (tfa.method !== null && tfa.method !== undefined) payload.method = tfa.method;
+        }
+        let resp = null;
+        try {
+          resp = await apiPost("/unlock", vid, payload);
+        } catch (err) {
+          // api() throws on !ok with body.detail as the message; recover
+          // the parsed body for the 402 branch via a raw fetch.
+          if (!/two-factor required/i.test(err.message || "")) throw err;
+          const raw = await fetch(API + "/unlock", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(Object.assign({ vault: vid }, payload)),
+          }).then((r) => r.json().catch(() => ({})));
+          if (!raw.methods || !raw.methods.length) throw err;
+          const first = raw.methods[0].id;
+          setTfa({ methods: raw.methods, method: first, code: "" });
+          setError(null);
+          setNotice("This account has two-step login — enter the code from your authenticator (or email), then Unlock again.");
+          return;
+        }
+        void resp;
+        setPw(""); setTfa(null);
         await refreshOne(vid);
         await refreshVaults().catch(() => {});
       } catch (e2) {
@@ -369,13 +409,34 @@
       status && !status.ok && h(Card, { key: "u" },
         h(CardContent, { className: "py-4" },
           h("form", { onSubmit: doUnlock, className: "flex gap-2 items-end" },
-            h("div", { className: "flex-1" },
-              h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
-              h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
-                         placeholder: "vault master password", autoFocus: true, disabled: unlocking })),
-            h(Button, { type: "submit", disabled: unlocking || !pw },
+            h("div", { className: "flex-1 space-y-3" },
+              h("div", null,
+                h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
+                h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
+                           placeholder: "vault master password", autoFocus: !tfa, disabled: unlocking })),
+              // Two-step login fields appear only after the server
+              // challenges (402) — never for plain-password accounts.
+              tfa && h("div", { className: "flex gap-2 items-end" },
+                h("div", null,
+                  h(Label, null, "Method"),
+                  h("select", {
+                    value: tfa.method, disabled: unlocking,
+                    onChange: (e) => setTfa(Object.assign({}, tfa, { method: Number(e.target.value) })),
+                    className: "h-9 rounded-md border border-input bg-background px-2 text-sm",
+                    "aria-label": "Two-step login method",
+                  }, tfa.methods.map((m) =>
+                    h("option", { key: m.id, value: m.id }, m.name)))),
+                h("div", { className: "flex-1" },
+                  h(Label, null, "Two-step code"),
+                  h(Input, {
+                    value: tfa.code, inputMode: "numeric", autoComplete: "one-time-code",
+                    autoFocus: true, disabled: unlocking,
+                    onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
+                    placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
+                  })))),
+            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code) },
               unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
-              unlocking ? "Unlocking…" : "Unlock")))),
+              unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock")))),
 
       status && !status.cli && h(Card, { key: "cli" },
         h(CardContent, { className: "py-3 text-sm" },
