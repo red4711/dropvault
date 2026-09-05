@@ -20,12 +20,36 @@ jobs:
 
       - name: Syntax + import checks
         run: |
-          python -m py_compile tools/register_account.py dashboard/plugin_api.py
+          python -m py_compile vault_handle.py __init__.py tools/register_account.py tools/render_files.py dashboard/plugin_api.py
           python - <<'EOF'
           import ast, pathlib
-          for f in ["tools/register_account.py", "dashboard/plugin_api.py"]:
+          for f in ["vault_handle.py", "__init__.py", "tools/register_account.py", "tools/render_files.py", "dashboard/plugin_api.py"]:
               ast.parse(pathlib.Path(f).read_text())
           print("parse OK")
+          EOF
+
+      - name: VaultHandle unit checks
+        run: |
+          python - <<'EOF'
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("vh", "vault_handle.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          h = m.VaultHandle("default", email="a@b.c")
+          assert h.session_env == "BW_SESSION"
+          h2 = m.VaultHandle("primary")
+          assert h2.session_env == "BW_SESSION_PRIMARY"
+          assert str(h.state_dir).endswith("Bitwarden CLI")
+          assert str(h2.state_dir).endswith("Bitwarden CLI-primary")
+          assert m.valid_vault_id("abc_123")
+          assert not m.valid_vault_id("Bad-Id!")
+          e = h2.bw_env("sess")
+          assert e["BW_SESSION"] == "sess" and e["BW_SESSION_PRIMARY"] == "sess"
+          assert "BW_SESSION" not in h2.bw_env()
+          m.VaultHandle("x", server_url="").ensure_server()  # no-op, must not raise
+          assert m.VaultHandle.maybe_b64_decode("aGVsbG8=") == "hello"
+          assert m.VaultHandle.maybe_b64_decode("not-b64!!") == "not-b64!!"
+          print("vault_handle unit checks OK")
           EOF
 
       - name: JS syntax check
