@@ -401,12 +401,6 @@ def register(ctx):
 # Auto-sync watchdog (opt-out via secrets.dropvault.auto_sync_minutes: 0)
 # ---------------------------------------------------------------------------
 
-def _load_dv_cfg() -> dict:
-    """Read secrets.dropvault config without raising (folder default 'hermes')."""
-    dv = _read_dropvault_section()
-    return {k: v for k, v in dv.items() if k != "enabled"} or {"folder": "hermes"}
-
-
 def _maybe_render_file_shims() -> None:
     """Render vault-managed files for non-Hermes consumers (fail-open).
 
