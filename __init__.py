@@ -104,7 +104,7 @@ def _load_vaults_cfg(dv: dict) -> Tuple[dict, List[dict]]:
     legacy_keys = ("folder", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     if any(k in dv for k in legacy_keys):
-        entry = {"id": "default", "label": "Local vault", "enabled": True}
+        entry = {"id": "default", "enabled": True}
         for k in legacy_keys:
             if k in dv and dv[k] is not None:
                 entry[k] = dv[k]

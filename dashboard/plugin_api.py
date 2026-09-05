@@ -105,7 +105,7 @@ def _load_vaults() -> list:
     legacy_keys = ("folder", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     if any(k in dv for k in legacy_keys):
-        entry = {"id": "default", "label": "Local vault"}
+        entry = {"id": "default"}
         for k in legacy_keys:
             if k in dv and dv[k] is not None:
                 entry[k] = dv[k]
@@ -113,7 +113,7 @@ def _load_vaults() -> list:
         entry.setdefault("session_env", LEGACY_SESSION_ENV)
         return [entry]
     # No vault keys at all: single default vault from folder fallback.
-    return [{"id": "default", "label": "Local vault",
+    return [{"id": "default",
              "folder": dv.get("folder", DEFAULT_FOLDER),
              "session_env": LEGACY_SESSION_ENV}]
 
