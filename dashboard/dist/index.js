@@ -439,9 +439,8 @@
       : null;
     const selLabel = legacy ? null : (selMeta && (selMeta.label || selMeta.id)) || sel;
 
-    const statusBadge = !status ? h(Spinner, { className: "h-4 w-4 text-muted-foreground" }) :
-      status.ok ? h(Badge, { key: "b" }, "unlocked") :
-      h(Badge, { key: "b", variant: "destructive" }, status.vault);
+    // Badge is rendered inside the vault card (VaultCard); the header no
+    // longer shows lock state — HeaderButtons is global actions only.
 
     // 3 skeleton rows shown while the folder content decrypts/loads.
     function SecretSkeleton() {
@@ -483,19 +482,13 @@
       }));
     }
 
-    // Header button cluster: per-vault Lock/Sync + global Sync env +
-    // a vault counter that opens the add/edit/remove manager.
-    // All labels are whitespace-nowrap: this skin's wide letter-spacing
-    // wraps two-word labels ("Sync env") onto two lines, making those
-    // buttons taller than their siblings.
+    // Header: global actions only. Per-vault Lock/Sync live inside the
+    // vault card below; the only per-vault thing here is the Vaults
+    // counter that opens the add/edit/remove manager.
     function HeaderButtons() {
       const n = (!legacy && vaults) ? vaults.length : (status ? 1 : 0);
       const nb = "whitespace-nowrap";
-      return h("div", { className: "flex items-center gap-2 flex-wrap" }, statusBadge,
-        status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy, className: nb },
-          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
-        status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
-          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
+      return h("div", { className: "flex items-center gap-2 flex-wrap" },
         status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy, className: nb },
           busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"),
         vaults !== null && h(Button, {
@@ -505,11 +498,10 @@
         }, `Vaults${n > 1 ? ` (${n})` : ""} +`));
     }
 
-    // Vault identity card — always rendered once roster/status loads, so
-    // even a single vault sits in a visual container with its connection
-    // details (account email, server, folder). Edit/Disable live here,
-    // next to the vault they affect. In multi mode the tab strip above
-    // switches selection; the card always shows the selected vault.
+    // One self-contained vault section: identity, unlock form, actions,
+    // and secrets all live inside this card, so Lock/Sync/secrets are
+    // visually grouped with the vault they belong to. In multi mode the
+    // tab strip above switches which vault is shown.
     function VaultCard() {
       const meta = legacy ? null : selMeta;
       const st = status;
@@ -522,8 +514,10 @@
       const live = meta ? statusBy[meta.id] : null;
       const ok = live ? !!live.ok : (st ? !!st.ok : !!((meta && meta.ok)));
       const state = (st && st.vault) || (meta && meta.vault) || (ok ? "unlocked" : "locked");
+      const nb = "whitespace-nowrap";
       return h(Card, { key: "vcard" },
-        h(CardContent, { className: "py-4 space-y-2" },
+        h(CardContent, { className: "py-4 space-y-4" },
+          // identity row
           h("div", { className: "flex items-center gap-2 flex-wrap" },
             h(LockDot, { ok }),
             h("span", { className: "font-medium" }, label),
@@ -544,8 +538,71 @@
             }, enabled ? "Disable" : "Enable")),
           (email || server) && h("p", { key: "conn", className: "text-sm text-muted-foreground" },
             [email, server].filter(Boolean).join(" · ")),
-          folder && h("p", { key: "fld", className: "text-xs text-muted-foreground" },
-            `Folder "${folder}"` + (secrets && st && st.ok ? ` · ${secrets.length} secrets` : ""))));
+          // unlock form (this vault only)
+          st && !st.ok && h("form", { key: "unlock", onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
+            h("div", { className: "flex-1 space-y-3 min-w-52" },
+              h("div", null,
+                h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
+                h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
+                           placeholder: "vault master password", autoFocus: !tfa, disabled: unlocking })),
+              tfa && h("div", { className: "flex gap-2 items-end" },
+                h("div", null,
+                  h(Label, null, "Method"),
+                  h("select", {
+                    value: tfa.method, disabled: unlocking,
+                    onChange: (e) => setTfa(Object.assign({}, tfa, { method: Number(e.target.value) })),
+                    className: "h-9 rounded-md border border-input bg-background px-2 text-sm",
+                    "aria-label": "Two-step login method",
+                  }, tfa.methods.map((m) =>
+                    h("option", { key: m.id, value: m.id }, m.name)))),
+                h("div", { className: "flex-1" },
+                  h(Label, null, "Two-step code"),
+                  h(Input, {
+                    value: tfa.code, inputMode: "numeric", autoComplete: "one-time-code",
+                    autoFocus: true, disabled: unlocking,
+                    onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
+                    placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
+                  })))),
+            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code), className: nb },
+              unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
+              unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock")),
+          st && !st.cli && h("p", { key: "cli", className: "text-sm" },
+            "The bw CLI is not installed on this host. Install with: npm install -g @bitwarden/cli"),
+          // actions + secrets (this vault only)
+          st && st.ok && h("div", { key: "actions", className: "flex items-center gap-2 flex-wrap" },
+            h(Button, { variant: "outline", size: "sm", onClick: doLock, disabled: busy, className: nb },
+              busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
+            h(Button, { variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
+              busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
+            folder && h("span", { className: "text-xs text-muted-foreground" },
+              `Folder "${folder}"` + (secrets ? ` · ${secrets.length} secrets` : ""))),
+          st && st.ok && showForm && h("form", { key: "form", onSubmit: doSave, className: "space-y-3 border-t pt-3" },
+            h("div", null,
+              h(Label, null, "Name (env var)"),
+              h(Input, { value: name, onChange: (e) => setName(e.target.value.toUpperCase()),
+                         placeholder: "OPENROUTER_API_KEY", disabled: !!editName, autoFocus: true })),
+            h("div", null,
+              h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
+              h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
+                         placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
+            h("div", { className: "flex gap-2 justify-end" },
+              h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
+              h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
+                busy && h(Spinner, { className: "h-4 w-4 mr-2" }),
+                editName ? "Update" : "Create"))),
+          st && st.ok && secrets === null && h("div", { key: "load", className: "py-2" }, h(SecretSkeleton)),
+          st && st.ok && secrets && (secrets.length === 0
+            ? h("p", { key: "empty", className: "text-sm text-muted-foreground py-4 text-center" },
+                "No secrets yet. Add one — it becomes an environment variable for Hermes tools.")
+            : h("div", { key: "list" },
+                h("div", { className: "flex items-center justify-end pb-1" },
+                  h(Button, { size: "sm", onClick: openNew, disabled: busy, className: nb }, "Add secret")),
+                h("ul", { className: "divide-y" },
+                  secrets.map((s) =>
+                    h("li", { key: s.name, className: "flex items-center justify-between py-2" },
+                      h("span", { className: "text-sm" }, s.name),
+                      h("div", { className: "flex items-center gap-2" },
+                        h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));
     }
 
     // Add/edit vault dialog + remove confirmation.
@@ -640,84 +697,7 @@
       // initial status check
       !status && !error && h(Card, { key: "st" },
         h(CardContent, { className: "py-6 flex items-center justify-center gap-2 text-sm text-muted-foreground" },
-          h(Spinner, { className: "h-4 w-4" }), "Checking vault status…")),
-
-      // unlock form (selected vault only)
-      status && !status.ok && h(Card, { key: "u" },
-        h(CardContent, { className: "py-4" },
-          h("form", { onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
-            h("div", { className: "flex-1 space-y-3" },
-              h("div", null,
-                h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
-                h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
-                           placeholder: "vault master password", autoFocus: !tfa, disabled: unlocking })),
-              // Two-step login fields appear only after the server
-              // challenges (402) — never for plain-password accounts.
-              tfa && h("div", { className: "flex gap-2 items-end" },
-                h("div", null,
-                  h(Label, null, "Method"),
-                  h("select", {
-                    value: tfa.method, disabled: unlocking,
-                    onChange: (e) => setTfa(Object.assign({}, tfa, { method: Number(e.target.value) })),
-                    className: "h-9 rounded-md border border-input bg-background px-2 text-sm",
-                    "aria-label": "Two-step login method",
-                  }, tfa.methods.map((m) =>
-                    h("option", { key: m.id, value: m.id }, m.name)))),
-                h("div", { className: "flex-1" },
-                  h(Label, null, "Two-step code"),
-                  h(Input, {
-                    value: tfa.code, inputMode: "numeric", autoComplete: "one-time-code",
-                    autoFocus: true, disabled: unlocking,
-                    onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
-                    placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
-                  })))),
-            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code), className: "whitespace-nowrap" },
-              unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
-              unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock")))),
-
-      status && !status.cli && h(Card, { key: "cli" },
-        h(CardContent, { className: "py-3 text-sm" },
-          "The bw CLI is not installed on this host. Install with: npm install -g @bitwarden/cli")),
-
-      status && status.ok && h(React.Fragment, { key: "main" },
-        h("div", { className: "flex items-center justify-between" },
-          h("h2", { className: "text-lg font-medium" },
-            `Secrets (${secrets ? secrets.length : "…"}) — folder "${status.folder}"`),
-          h(Button, { size: "sm", onClick: openNew, disabled: busy }, "Add secret")),
-
-        showForm && h(Card, { key: "form" },
-          h(CardContent, { className: "py-4" },
-            h("form", { onSubmit: doSave, className: "space-y-3" },
-              h("div", null,
-                h(Label, null, "Name (env var)"),
-                h(Input, { value: name, onChange: (e) => setName(e.target.value.toUpperCase()),
-                           placeholder: "OPENROUTER_API_KEY", disabled: !!editName, autoFocus: true })),
-              h("div", null,
-                h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
-                h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
-                           placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
-              h("div", { className: "flex gap-2 justify-end" },
-                h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
-                h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
-                  busy && h(Spinner, { className: "h-4 w-4 mr-2" }),
-                  editName ? "Update" : "Create"))))),
-
-        status.ok && secrets === null && h(Card, { key: "load" },
-          h(CardContent, { className: "py-2" }, h(SecretSkeleton))),
-
-        secrets && h(Card, { key: "list" },
-          h(CardContent, { className: "py-2" },
-            secrets.length === 0
-              ? h("p", { className: "text-sm text-muted-foreground py-4 text-center" },
-                  "No secrets yet. Add one — it becomes an environment variable for Hermes tools.")
-              : h("ul", { className: "divide-y" },
-                  secrets.map((s) =>
-                    h("li", { key: s.name, className: "flex items-center justify-between py-2" },
-                      // plain text — the dashboard's <code> styling is a multi-color
-                      // gradient; render names as normal text
-                      h("span", { className: "text-sm" }, s.name),
-                      h("div", { className: "flex items-center gap-2" },
-                        h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));
+          h(Spinner, { className: "h-4 w-4" }), "Checking vault status…")));
   }
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
