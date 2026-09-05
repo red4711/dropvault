@@ -1,8 +1,15 @@
 """Dropvault — Vaultwarden secret source for Hermes Agent.
 
 Registers one SecretSource per configured vault (``secrets.dropvault.vaults``)
-that resolves env vars from a dedicated folder ("hermes" by default) in a
-self-hosted Vaultwarden / Bitwarden vault.
+that resolves env vars from a Bitwarden scope in a self-hosted
+Vaultwarden / Bitwarden vault.
+
+Scope per vault (``collection:`` wins, else ``folder:``, else whole vault):
+  * collection = Bitwarden collection name (needs an org on the server).
+    An item can live in many collections; exactly the "expose a slice of a
+    big vault" mechanic.
+  * folder = legacy personal-vault folder (back-compat).
+  * neither = whole-vault dump (dedicated service account).
 
 Conventions:
   * Every item NAME in the folder is an environment-variable name
@@ -20,7 +27,9 @@ Config:
       auto_sync_minutes: 10
       file_shims: [...]
       vaults:
-        - {id: default, folder: hermes, email: ..., server_url: ..., ca_cert: ...}
+        - {id: default, collection: hermes, email: ..., server_url: ...}
+        - {id: big, folder: oldhermes, ...}   # back-compat
+        - {id: svc, ...}                      # no scope = whole vault
 Legacy single-vault config (flat folder/email/server_url/ca_cert keys, no
 ``vaults`` list) auto-migrates to ``vaults: [{id: default, ...}]`` in code.
 """
@@ -36,14 +45,22 @@ from typing import Dict, FrozenSet, List, Tuple
 try:
     from .vault_handle import (
         DEFAULT_FOLDER,
+        SCOPE_COLLECTION,
+        SCOPE_FOLDER,
+        SCOPE_WHOLE_VAULT,
         VaultHandle,
+        scope_for,
         session_env_for,
         valid_vault_id,
     )
 except ImportError:  # loaded as top-level module (tests / odd loaders)
     from vault_handle import (  # type: ignore[no-redef]
         DEFAULT_FOLDER,
+        SCOPE_COLLECTION,
+        SCOPE_FOLDER,
+        SCOPE_WHOLE_VAULT,
         VaultHandle,
+        scope_for,
         session_env_for,
         valid_vault_id,
     )
@@ -67,6 +84,12 @@ def _cfg_get(cfg: dict, key: str, default):
 
 def _load_vaults_cfg(dv: dict) -> Tuple[dict, List[dict]]:
     """Split secrets.dropvault into (global_cfg, [vault_dict, ...]).
+
+    Scope (collection XOR folder XOR whole vault) is per vault entry:
+    `collection:` wins, else `folder:`, else whole vault. Neither the
+    global section nor new entries default the scope — an explicit
+    `folder: hermes` stays only for back-compat (legacy flat config and
+    entries written before scopes existed).
 
     Legacy flat config (folder/email/server_url/ca_cert/cli_* without a
     ``vaults`` list) migrates to ``[{id: default, ...}]`` in code — the
@@ -96,19 +119,19 @@ def _load_vaults_cfg(dv: dict) -> Tuple[dict, List[dict]]:
             if not entry.get("enabled", True):
                 continue
             merged = dict(entry)
-            merged.setdefault("folder", global_cfg.get("folder", DEFAULT_FOLDER))
             merged.setdefault("session_env", session_env_for(vid))
             out.append(merged)
         return global_cfg, out
-    # Legacy single-vault migration: flat keys become vault id=default.
-    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+    # Legacy single-vault migration: flat keys become vault id=default,
+    # migrating a stored `folder:` as-is (no new default). A legacy config
+    # with no scope at all means whole vault going forward.
+    legacy_keys = ("folder", "collection", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     if any(k in dv for k in legacy_keys):
         entry = {"id": "default", "enabled": True}
         for k in legacy_keys:
             if k in dv and dv[k] is not None:
                 entry[k] = dv[k]
-        entry.setdefault("folder", DEFAULT_FOLDER)
         entry.setdefault("session_env", "BW_SESSION")
         return global_cfg, [entry]
     return global_cfg, []
@@ -118,7 +141,8 @@ def _handle_from_entry(entry: dict) -> VaultHandle:
     return VaultHandle(
         entry.get("id", "default"),
         email=str(entry.get("email") or ""),
-        folder=str(entry.get("folder") or DEFAULT_FOLDER),
+        folder=entry.get("folder"),
+        collection=entry.get("collection"),
         server_url=str(entry.get("server_url") or ""),
         ca_cert=str(entry.get("ca_cert") or ""),
         cli_path=str(entry.get("cli_path") or ""),
@@ -129,15 +153,46 @@ def _handle_from_entry(entry: dict) -> VaultHandle:
     )
 
 
-class VwVaultSource(SecretSource):
-    """Resolve env vars from one Vaultwarden folder via the `bw` CLI."""
+def _scope_items_argv(handle: VaultHandle, session: str, timeout: float,
+                      cfg: dict | None = None):
+    """Resolve a vault's scope to a `bw list items` argv + describe it.
 
-    shape = "bulk"  # folder dump; explicit maps elsewhere win precedence
+    Returns (argv, scope_desc). Whole vault = unfiltered dump; folder and
+    collection resolve names → ids first (missing scope = (None, desc) so
+    the caller can report a clean NOT_CONFIGURED instead of dumping
+    everything). Never logs values.
+    """
+    mode, name = handle.scope
+    if mode == SCOPE_WHOLE_VAULT:
+        return ["list", "items"], "whole vault"
+    if mode == SCOPE_FOLDER:
+        _, folders = handle.run_json(["list", "folders"], session=session,
+                                     timeout=timeout)
+        folder = next((f for f in folders if f.get("name") == name), None)
+        if folder is None:
+            return None, f"folder '{name}'"
+        return (["list", "items", "--folderid", folder.get("id")],
+                f"folder '{name}'")
+    # SCOPE_COLLECTION — needs an org; `bw list collections` is org-agnostic.
+    _, collections = handle.run_json(["list", "collections"], session=session,
+                                     timeout=timeout)
+    coll = next((c for c in collections if c.get("name") == name), None)
+    if coll is None:
+        return None, f"collection '{name}'"
+    return (["list", "items", "--collectionid", coll.get("id")],
+            f"collection '{name}'")
+
+
+class VwVaultSource(SecretSource):
+    """Resolve env vars from one Vaultwarden scope via the `bw` CLI."""
+
+    shape = "bulk"  # scope dump; explicit maps elsewhere win precedence
 
     def __init__(self, handle: VaultHandle | None = None,
                  source_name: str = "", label: str = "",
                  session_env: str = "", folder: str = "",
-                 timeout: float = 30.0, enabled: bool = True):
+                 timeout: float = 30.0, enabled: bool = True,
+                 collection: str = ""):
         # Zero-arg construction (watchdog fallback / old call sites) yields
         # the default vault; _ensure_init fills the rest lazily.
         self._enabled = bool(enabled)
@@ -146,7 +201,8 @@ class VwVaultSource(SecretSource):
             self.name = "dropvault"
             self.label = "Dropvault (Vaultwarden)"
             self._session_env = "BW_SESSION"
-            self._folder = DEFAULT_FOLDER
+            self._folder = ""  # no scope = whole vault (no legacy default)
+            self._collection = ""
             self.timeout = 30.0
             self.scheme = "vw-default"
             self._cli = None
@@ -155,7 +211,10 @@ class VwVaultSource(SecretSource):
         self.name = source_name
         self.label = label
         self._session_env = session_env
-        self._folder = folder or DEFAULT_FOLDER
+        # Scope overrides: explicit ctor args win, else the handle's.
+        # Empty = inherit (whole vault unless the handle sets a scope).
+        self._folder = folder if folder else (handle.folder or "")
+        self._collection = (collection or "").strip() or handle.collection
         try:
             self.timeout = float(timeout or 30.0)
         except (TypeError, ValueError):
@@ -178,7 +237,8 @@ class VwVaultSource(SecretSource):
         self.name = "dropvault"
         self.label = "Dropvault (Vaultwarden)"
         self._session_env = "BW_SESSION"
-        self._folder = DEFAULT_FOLDER
+        self._folder = ""  # no scope = whole vault (no legacy default)
+        self._collection = getattr(self, "_collection", "")
         self.timeout = 30.0
         self.scheme = "vw-default"
         self._cli = None
@@ -228,8 +288,13 @@ class VwVaultSource(SecretSource):
             result.error_kind = ErrorKind.BINARY_MISSING
             return result
 
-        folder_name = str(self._cfg_get(cfg, "folder", self._folder)
-                          or self._folder)
+        # Scope: cfg slice wins when the orchestrator passes per-source
+        # config, else the instance (handle) scope. Collection > folder >
+        # whole vault; empty = whole vault.
+        cfg_coll = str(cfg.get("collection") or "").strip() if isinstance(cfg, dict) else ""
+        cfg_folder = str(cfg.get("folder") or "").strip() if isinstance(cfg, dict) else ""
+        eff_collection = cfg_coll or getattr(self, "_collection", "") or ""
+        eff_folder = cfg_folder or getattr(self, "_folder", "") or ""
         # cfg slice wins when the orchestrator passes per-source config.
         timeout = self.timeout
         try:
@@ -252,18 +317,20 @@ class VwVaultSource(SecretSource):
                 )
                 return result
 
-            # 2. locate the managed folder
-            _, folders = self._bw_json(["list", "folders"], session, timeout)
-            folder = next((f for f in folders if f.get("name") == folder_name), None)
-            if folder is None:
-                result.error = f"Folder '{folder_name}' not found in vault. Add a secret from the Dropvault tab (it creates the folder)."
+            # 2. resolve the scope → `bw list items` argv
+            scope_handle = VaultHandle(
+                self._handle.vid, folder=eff_folder, collection=eff_collection)
+            argv, scope_desc = _scope_items_argv(
+                scope_handle, session, timeout)
+            if argv is None:
+                result.error = (
+                    f"{scope_desc} not found in vault. "
+                    "Add a secret from the Dropvault tab (it creates the scope).")
                 result.error_kind = ErrorKind.NOT_CONFIGURED
                 return result
-            folder_id = folder.get("id")
 
-            # 3. dump the folder; item name = env var name
-            _, items = self._bw_json(["list", "items", "--folderid", folder_id],
-                                     session, timeout * 2)
+            # 3. dump the scope; item name = env var name
+            _, items = self._bw_json(argv, session, timeout * 2)
             secrets: Dict[str, str] = {}
             for item in items:
                 name = self._maybe_b64_decode((item.get("name") or "").strip())
@@ -323,7 +390,8 @@ class VwVaultSource(SecretSource):
     def config_schema(self) -> dict:
         return {
             "enabled": {"description": "Enable the Dropvault secret source", "default": False},
-            "folder": {"description": "Vault folder whose item names are env vars", "default": DEFAULT_FOLDER},
+            "collection": {"description": "Bitwarden collection whose items become env vars (needs an org; wins over folder; empty = whole vault unless folder set)", "default": ""},
+            "folder": {"description": "Vault folder whose item names are env vars (back-compat; empty = whole vault unless collection set)", "default": ""},
             "cli_timeout_seconds": {"description": "Per bw-call timeout", "default": 30.0},
         }
 
@@ -371,9 +439,10 @@ def _build_sources(dv_cfg: dict) -> List[VwVaultSource]:
             _source_name_for(vid, lone_default),
             label,
             str(entry.get("session_env") or session_env_for(vid)),
-            str(entry.get("folder") or DEFAULT_FOLDER),
+            entry.get("folder") or "",
             timeout,
             bool(entry.get("enabled", True)),
+            str(entry.get("collection") or ""),
         ))
     return sources
 
@@ -508,9 +577,9 @@ def _maybe_render_file_shims(session: str | None = None) -> None:
         rlog.warning("file shim render skipped: %s", exc)
 
 
-def _vault_hash_for(handle: VaultHandle, session_env: str, folder: str,
+def _vault_hash_for(handle: VaultHandle, session_env: str,
                     timeout: float, env) -> str | None:
-    """Hash of (name, value) pairs for one vault; None when unavailable."""
+    """Hash of (name, value) pairs for one vault scope; None when unavailable."""
     session = ((env.get(session_env) or "").strip()
                if hasattr(env, "get") else "")
     if not session:
@@ -520,15 +589,11 @@ def _vault_hash_for(handle: VaultHandle, session_env: str, folder: str,
                                     timeout=timeout)
         if status.get("status") != "unlocked":
             return None
-        _, folders = handle.run_json(["list", "folders"], session=session,
-                                     timeout=timeout)
-        folder_obj = next((f for f in folders
-                           if f.get("name") == folder), None)
-        if folder_obj is None:
-            return None
-        _, items = handle.run_json(
-            ["list", "items", "--folderid", folder_obj.get("id")],
-            session=session, timeout=timeout * 2)
+        argv, _ = _scope_items_argv(handle, session, timeout)
+        if argv is None:
+            return None  # scope not found (yet) — stay quiet, not an error
+        _, items = handle.run_json(argv, session=session,
+                                   timeout=timeout * 2)
         h = hashlib.sha256()
         pairs = []
         for item in items:
@@ -588,7 +653,6 @@ def _auto_sync_loop(mins: int) -> None:
                     handle,
                     str(entry.get("session_env")
                         or session_env_for(entry.get("id"))),
-                    str(entry.get("folder") or DEFAULT_FOLDER),
                     float(entry.get("cli_timeout_seconds", 30.0) or 30.0),
                     env,
                 )

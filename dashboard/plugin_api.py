@@ -129,6 +129,9 @@ def _load_vaults(*, include_disabled: bool = False) -> list:
     Disabled vaults are SKIPPED by default (they're invisible to the
     gateway); pass include_disabled=True for the dashboard roster, which
     must show them greyed-out with an enable toggle.
+
+    Scope (collection/folder) is per entry, no defaults applied — absent
+    scope = whole vault. Legacy flat `folder:` migrates as-is.
     """
     dv = _dropvault_cfg()
     raw = dv.get("vaults")
@@ -144,23 +147,20 @@ def _load_vaults(*, include_disabled: bool = False) -> list:
             if not include_disabled and not entry.get("enabled", True):
                 continue
             merged = dict(entry)
-            merged.setdefault("folder", dv.get("folder", DEFAULT_FOLDER))
             merged.setdefault("session_env", _session_env_for(vid))
             out.append(merged)
         return out
-    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+    legacy_keys = ("folder", "collection", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     if any(k in dv for k in legacy_keys):
         entry = {"id": "default"}
         for k in legacy_keys:
             if k in dv and dv[k] is not None:
                 entry[k] = dv[k]
-        entry.setdefault("folder", DEFAULT_FOLDER)
         entry.setdefault("session_env", LEGACY_SESSION_ENV)
         return [entry]
-    # No vault keys at all: single default vault from folder fallback.
+    # No vault keys at all: single default vault, no scope = whole vault.
     return [{"id": "default",
-             "folder": dv.get("folder", DEFAULT_FOLDER),
              "session_env": LEGACY_SESSION_ENV}]
 
 
@@ -323,8 +323,65 @@ def _require_unlocked(cfg: dict) -> str:
     return session
 
 
+def _scope_items_argv(cfg: dict, session: str) -> tuple:
+    """Resolve a vault's scope to a `bw list items` argv + short desc.
+
+    Scope: `collection:` wins, else `folder:`, else whole vault.
+    Returns (argv, desc); missing named scope → (None, desc) so callers
+    report a clean error instead of dumping everything.
+    """
+    collection = str(cfg.get("collection") or "").strip()
+    folder_name = str(cfg.get("folder") or "").strip()
+    if collection:
+        collections = _run_bw_json(cfg, ["list", "collections"],
+                                   session=session, timeout=60)
+        coll = next((c for c in collections if c.get("name") == collection),
+                    None)
+        if coll is None:
+            return None, f"collection '{collection}'"
+        return (["list", "items", "--collectionid", coll.get("id")],
+                f"collection '{collection}'")
+    if folder_name:
+        folders = _run_bw_json(cfg, ["list", "folders"], session=session,
+                               timeout=60)
+        folder = next((f for f in folders if f.get("name") == folder_name),
+                      None)
+        if folder is None:
+            return None, f"folder '{folder_name}'"
+        return (["list", "items", "--folderid", folder.get("id")],
+                f"folder '{folder_name}'")
+    return ["list", "items"], "whole vault"
+
+
+def _create_target(cfg: dict, session: str) -> dict:
+    """Where a new secret goes: collection (org item) XOR folder XOR none.
+
+    Returns the item-framework dict ({"collectionIds": [...]} /
+    {"folderId": ...} / {}). Creates a missing FOLDER on demand (personal
+    vault mechanic); a missing COLLECTION is a 422 — collections live
+    under orgs and the dashboard must not mint org structure silently.
+    """
+    collection = str(cfg.get("collection") or "").strip()
+    folder_name = str(cfg.get("folder") or "").strip()
+    if collection:
+        collections = _run_bw_json(cfg, ["list", "collections"],
+                                   session=session, timeout=60)
+        coll = next((c for c in collections if c.get("name") == collection),
+                    None)
+        if coll is None:
+            raise HTTPException(
+                422, f"collection '{collection}' not found — create it in "
+                "the org first (collections need an organization)")
+        return {"collectionIds": [coll.get("id")]}
+    if folder_name:
+        return {"folderId": _folder_id(cfg, session)}
+    return {}
+
+
 def _folder_id(cfg: dict, session: str) -> str:
-    folder_name = str(cfg.get("folder") or DEFAULT_FOLDER)
+    folder_name = str(cfg.get("folder") or "").strip()
+    if not folder_name:
+        raise HTTPException(500, "no folder scope configured")
     folders = _run_bw_json(cfg, ["list", "folders"], session=session,
                            timeout=60)
     fid = next((f["id"] for f in folders if f.get("name") == folder_name), None)
@@ -337,11 +394,21 @@ def _folder_id(cfg: dict, session: str) -> str:
     return json.loads(proc.stdout)["id"]
 
 
-def _find_item(cfg: dict, session: str, folder_id: str,
+def _find_item(cfg: dict, session: str, scope_argv: list,
                name: str) -> Optional[dict]:
-    items = _run_bw_json(cfg, ["list", "items", "--folderid", folder_id],
-                         session=session, timeout=90)
+    items = _run_bw_json(cfg, scope_argv, session=session, timeout=90)
     return next((i for i in items if (i.get("name") or "") == name), None)
+
+
+def _scope_label(cfg: dict) -> str:
+    """Short scope description for roster rows (no values)."""
+    coll = str(cfg.get("collection") or "").strip()
+    if coll:
+        return f"collection '{coll}'"
+    fol = str(cfg.get("folder") or "").strip()
+    if fol:
+        return f"folder '{fol}'"
+    return "whole vault"
 
 
 def _vault_summary(cfg: dict) -> dict:
@@ -368,7 +435,9 @@ def _vault_summary(cfg: dict) -> dict:
         "vault": vault_state,
         "email": email or (str(cfg.get("email") or "") or None),
         "server": server or (str(cfg.get("server_url") or "") or None),
-        "folder": str(cfg.get("folder") or DEFAULT_FOLDER),
+        "folder": str(cfg.get("folder") or ""),
+        "collection": str(cfg.get("collection") or ""),
+        "scope": _scope_label(cfg),
         "enabled": bool(cfg.get("enabled", True)),
         "has_ca": bool(cfg.get("ca_cert")),
     }
@@ -401,6 +470,8 @@ class VaultUpsertBody(BaseModel):
     Only plain connection fields — never secrets or sessions.
     `id` is [a-z0-9_]+; `server_url` must be http(s); `ca_cert` must be
     an existing file when given. Omit `ca_cert` for public HTTPS.
+    Scope: `collection` wins over `folder`; empty string CLEARS that
+    scope; both empty = whole vault. Folder is back-compat.
     """
 
     id: str
@@ -408,6 +479,7 @@ class VaultUpsertBody(BaseModel):
     email: Optional[str] = None
     server_url: Optional[str] = None
     folder: Optional[str] = None
+    collection: Optional[str] = None
     ca_cert: Optional[str] = None
     enabled: Optional[bool] = None
 
@@ -458,7 +530,9 @@ def _status_for(cfg: dict):
         "email": email,
         "server": server,
         "cli": bool(_resolve_cli(cfg)),
-        "folder": str(cfg.get("folder") or DEFAULT_FOLDER),
+        "folder": str(cfg.get("folder") or ""),
+        "collection": str(cfg.get("collection") or ""),
+        "scope": _scope_label(cfg),
         "id": str(cfg.get("id")),
         "label": cfg.get("label") or str(cfg.get("id")),
     }
@@ -478,9 +552,10 @@ def status_one(vid: str):
 def _secrets_for(cfg: dict):
     """Names + metadata only — values never leave the vault here."""
     session = _require_unlocked(cfg)
-    data = _run_bw_json(cfg, ["list", "items", "--folderid",
-                              _folder_id(cfg, session)],
-                        session=session, timeout=60)
+    scope_argv, scope_desc = _scope_items_argv(cfg, session)
+    if scope_argv is None:
+        raise HTTPException(404, f"{scope_desc} not found in vault")
+    data = _run_bw_json(cfg, scope_argv, session=session, timeout=60)
     return {
         "secrets": [
             {
@@ -514,8 +589,11 @@ def upsert_secret(body: SecretBody):
     if not body.value:
         raise HTTPException(422, "value must not be empty")
 
-    fid = _folder_id(cfg, session)
-    existing = _find_item(cfg, session, fid, name)
+    scope = _create_target(cfg, session)
+    scope_argv, _ = _scope_items_argv(cfg, session)
+    if scope_argv is None:
+        scope_argv = ["list", "items"]  # scope not created yet: no dup check
+    existing = _find_item(cfg, session, scope_argv, name)
 
     item = {
         "type": 1,
@@ -523,7 +601,7 @@ def upsert_secret(body: SecretBody):
         "notes": body.notes or None,
         "login": {"username": None, "password": body.value, "uris": None,
                   "totp": None},
-        "folderId": fid,
+        **scope,
     }
     if existing:
         payload = {**existing, **item, "id": existing["id"]}
@@ -640,7 +718,8 @@ def lock(body: VaultBody = None):
 # ---------------------------------------------------------------------------
 
 _VAULT_EDITABLE_KEYS = (
-    "label", "email", "server_url", "folder", "ca_cert", "enabled",
+    "label", "email", "server_url", "folder", "collection", "ca_cert",
+    "enabled",
 )
 
 
@@ -689,17 +768,18 @@ def _migrate_flat_to_vaults(dv: dict) -> list:
 
     Mutates `dv` in place (moves flat keys into the vault entry) and
     returns the live list object inside `dv` so callers can edit it.
+    Legacy flat `folder:` migrates as-is (no scope default applied —
+    a fresh entry gets no scope = whole vault until the user sets one).
     """
     raw = dv.get("vaults")
     if isinstance(raw, list) and raw:
         return raw
-    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+    legacy_keys = ("folder", "collection", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     entry: dict = {"id": "default"}
     for k in legacy_keys:
         if k in dv and dv[k] is not None:
             entry[k] = dv.pop(k)
-    entry.setdefault("folder", DEFAULT_FOLDER)
     dv["vaults"] = [entry]
     return dv["vaults"]
 
@@ -732,7 +812,12 @@ def _validate_vault_fields(body: VaultUpsertBody, *, is_new: bool) -> dict:
         folder = body.folder.strip()
         if folder and not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,127}$", folder):
             raise HTTPException(422, "folder name looks invalid")
-        out["folder"] = folder or DEFAULT_FOLDER
+        out["folder"] = folder  # empty string clears the scope
+    if body.collection is not None:
+        coll = body.collection.strip()
+        if coll and not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,127}$", coll):
+            raise HTTPException(422, "collection name looks invalid")
+        out["collection"] = coll  # empty clears; wins over folder at fetch
     if body.ca_cert is not None:
         ca = body.ca_cert.strip()
         if ca and not os.path.isfile(os.path.expanduser(ca)):
@@ -758,8 +843,7 @@ def add_vault(body: VaultUpsertBody):
         if any(isinstance(v, dict) and v.get("id") == fields["id"] for v in vaults):
             raise HTTPException(
                 409, f"vault '{fields['id']}' already exists — edit it instead")
-        entry = {"id": fields["id"], "enabled": True,
-                 "folder": DEFAULT_FOLDER}
+        entry = {"id": fields["id"], "enabled": True}
         for k in _VAULT_EDITABLE_KEYS:
             if k in fields:
                 entry[k] = fields[k]

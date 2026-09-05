@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Render vault-managed files for non-Hermes consumers.
 
-Reads secrets from the Dropvault vault folder (same pattern as
-VwVaultSource.fetch: `bw list items --folderid` + best-effort base64
+Reads secrets from each vault's scope (same pattern as
+VwVaultSource.fetch: scope → `bw list items` + best-effort base64
 decode of names/values) and writes them to plain files that plain
 systemd units / scripts consume:
 
@@ -91,7 +91,11 @@ def _vault_state_dir(vid: str, cli_data_dir: str = "") -> Path:
 
 def _load_vaults(dv: dict) -> list:
     """Return [vault_dict, ...] with legacy flat config migrated to
-    [{id: default, ...}]. Invalid entries skipped, never raised."""
+    [{id: default, ...}]. Invalid entries skipped, never raised.
+
+    Scope (collection/folder) is per entry, no defaults applied — absent
+    scope = whole vault. Legacy flat `folder:` migrates as-is.
+    """
     if not isinstance(dv, dict):
         return []
     raw = dv.get("vaults")
@@ -107,18 +111,16 @@ def _load_vaults(dv: dict) -> list:
             if not entry.get("enabled", True):
                 continue
             merged = dict(entry)
-            merged.setdefault("folder", dv.get("folder", DEFAULT_FOLDER))
             merged.setdefault("session_env", _session_env_for(vid))
             out.append(merged)
         return out
-    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+    legacy_keys = ("folder", "collection", "email", "server_url", "ca_cert",
                    "cli_path", "cli_data_dir", "cli_timeout_seconds")
     if any(k in dv for k in legacy_keys):
         entry = {"id": "default", "enabled": True}
         for k in legacy_keys:
             if k in dv and dv[k] is not None:
                 entry[k] = dv[k]
-        entry.setdefault("folder", DEFAULT_FOLDER)
         entry.setdefault("session_env", LEGACY_SESSION_ENV)
         return [entry]
     return []
@@ -201,8 +203,9 @@ def fetch_vault_secrets(cfg: dict, vid: str = "default",
                       session: str | None = None) -> dict | None:
     """Return {name: value} or None when the vault is unavailable (fail-open).
 
-    None = locked / not configured / binary missing / network error.
-    Never raises, never logs values.
+    Scope: `collection:` wins, else `folder:`, else whole vault.
+    None = locked / not configured / binary missing / network error /
+    scope not found. Never raises, never logs values.
     """
     if not session:
         session_env = str((cfg or {}).get("session_env")
@@ -214,7 +217,8 @@ def fetch_vault_secrets(cfg: dict, vid: str = "default",
     if cli is None:
         return None
     timeout = float((cfg or {}).get("cli_timeout_seconds", 30.0) or 30.0)
-    folder_name = str((cfg or {}).get("folder", DEFAULT_FOLDER))
+    collection = str((cfg or {}).get("collection") or "").strip()
+    folder_name = str((cfg or {}).get("folder") or "").strip()
     try:
         env = _bw_env(session, cfg, vid)
         r = subprocess.run([cli, "status"], env=env, capture_output=True,
@@ -225,17 +229,29 @@ def fetch_vault_secrets(cfg: dict, vid: str = "default",
             state = ""
         if state != "unlocked":
             return None
-        r = subprocess.run([cli, "list", "folders"], env=env, capture_output=True,
-                           text=True, timeout=timeout)
-        if r.returncode != 0:
-            return None
-        folders = json.loads(r.stdout or "[]")
-        folder = next((f for f in folders if f.get("name") == folder_name), None)
-        if folder is None:
-            return None
-        r = subprocess.run([cli, "list", "items", "--folderid", folder.get("id", "")],
-                           env=env, capture_output=True, text=True,
-                           timeout=timeout * 2)
+        argv = ["list", "items"]
+        if collection:
+            r = subprocess.run([cli, "list", "collections"], env=env,
+                               capture_output=True, text=True, timeout=timeout)
+            if r.returncode != 0:
+                return None
+            coll = next((c for c in json.loads(r.stdout or "[]")
+                         if c.get("name") == collection), None)
+            if coll is None:
+                return None  # scope not found (yet) — quiet, not an error
+            argv = ["list", "items", "--collectionid", coll.get("id", "")]
+        elif folder_name:
+            r = subprocess.run([cli, "list", "folders"], env=env, capture_output=True,
+                               text=True, timeout=timeout)
+            if r.returncode != 0:
+                return None
+            folders = json.loads(r.stdout or "[]")
+            folder = next((f for f in folders if f.get("name") == folder_name), None)
+            if folder is None:
+                return None  # scope not found (yet) — quiet, not an error
+            argv = ["list", "items", "--folderid", folder.get("id", "")]
+        r = subprocess.run([cli, *argv], env=env, capture_output=True,
+                           text=True, timeout=timeout * 2)
         if r.returncode != 0:
             return None
         secrets: dict[str, str] = {}
@@ -271,14 +287,12 @@ def load_shim_config() -> tuple[dict, list, list]:
         shims = dv.get("file_shims") or []
         cfg = {k: v for k, v in dv.items()
                if k not in ("file_shims", "vaults")}
-        cfg.setdefault("folder", DEFAULT_FOLDER)
         cfg.setdefault("session_env", LEGACY_SESSION_ENV)
         vaults = _load_vaults(dv)
         return cfg, vaults, shims if isinstance(shims, list) else []
     except Exception as exc:
         print(f"render_files: cannot load {CONFIG_PATH}: {exc}", file=sys.stderr)
-        return {"folder": DEFAULT_FOLDER,
-                "session_env": LEGACY_SESSION_ENV}, [], []
+        return {"session_env": LEGACY_SESSION_ENV}, [], []
 
 
 # --------------------------------------------------------------------------- #

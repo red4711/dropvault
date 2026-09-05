@@ -43,6 +43,13 @@ jobs:
           assert str(h2.state_dir).endswith("Bitwarden CLI-primary")
           assert m.valid_vault_id("abc_123")
           assert not m.valid_vault_id("Bad-Id!")
+          assert m.scope_for({}) == ("whole", "")
+          assert m.scope_for({"folder": " "}) == ("whole", "")
+          assert m.scope_for({"folder": "hermes"}) == ("folder", "hermes")
+          assert m.scope_for({"folder": "hermes", "collection": "team"}) == ("collection", "team")
+          assert m.VaultHandle("x").scope == ("whole", "")
+          assert m.VaultHandle("x", folder="hermes").scope == ("folder", "hermes")
+          assert m.VaultHandle("x", folder="hermes", collection="team").scope == ("collection", "team")
           e = h2.bw_env("sess")
           assert e["BW_SESSION"] == "sess" and e["BW_SESSION_PRIMARY"] == "sess"
           assert "BW_SESSION" not in h2.bw_env()

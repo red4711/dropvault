@@ -25,11 +25,11 @@ Two plugins in one package:
 
 1. **SecretSource plugin** (`__init__.py`) — one Hermes secret source per
    configured vault (`secrets.dropvault.vaults`; legacy flat config still
-   works as `id: default`). At Hermes startup, each dumps its managed
-   vault folder (default: `hermes`) through the `bw` CLI — isolated CLI
-   state dirs, so vaults never fight — and applies every item as an
-   environment variable. Item **name** = env-var name; item **password**
-   = value.
+   works as `id: default`). At Hermes startup, each dumps its scope
+   (`collection:` wins, else `folder:`, else the whole vault) through the
+   `bw` CLI — isolated CLI state dirs, so vaults never fight — and applies
+   every item as an environment variable. Item **name** = env-var name;
+   item **password** = value.
 2. **Dashboard plugin** (`dashboard/`) — a "Dropvault" tab in the Hermes
    dashboard with a vault switcher (one vault = the familiar single-vault
    UI, no extra chrome):
@@ -106,31 +106,42 @@ secrets:
     vaults:
       - id: default
         enabled: true
-        folder: hermes          # vault folder whose items become env vars
+        collection: hermes   # Bitwarden collection; item names become env vars (needs an org)
         email: you@example.com
         server_url: https://vault.example.com   # omit ca_cert: public HTTPS uses system CAs
         # server_url empty = leave the bw CLI's server config alone
 ```
 
+Scope per vault is yours to choose — `collection:` wins, else `folder:`
+(legacy personal-vault folder, back-compat), else the whole vault when
+neither is set. That last mode is the dedicated-service-account shape:
+every login-type item in the account becomes an env var. A big personal
+vault stays quiet by naming a collection (or folder) and exposing only
+that slice to Hermes.
+
 **Option B — a second vault** (e.g. family server, work org). Add another
 entry; each vault gets its own CLI state dir, session var
-(`BW_SESSION_<ID>`), unlock, folder, and optional `ca_cert`:
+(`BW_SESSION_<ID>`), unlock, scope (`collection:` / `folder:` / whole
+vault), and optional `ca_cert`:
 
 ```yaml
 secrets:
   dropvault:
     enabled: true
     vaults:
-      - {id: default, folder: hermes, email: you@local, server_url: https://127.0.0.1:8443, ca_cert: ~/vw-certs/ca.crt}
-      - {id: primary, folder: hermes, email: you@example.com, server_url: https://vault.example.com}
+      - {id: default, collection: hermes, email: you@local, server_url: https://127.0.0.1:8443, ca_cert: ~/vw-certs/ca.crt}
+      - {id: primary, folder: oldhermes, email: you@example.com, server_url: https://vault.example.com}
+      - {id: svc, email: svc@example.com, server_url: https://vault.example.com}   # no scope = whole vault
 ```
 
 Same env var in two vaults = first source wins (order via
 `secrets.sources: [dropvault_default, dropvault_primary]`); distinct
-folders per vault avoid surprises. One vault configured? Its source keeps
+scopes per vault avoid surprises. One vault configured? Its source keeps
 the plain `dropvault` name, so existing setups keep working untouched —
-the flat single-vault config (`folder`/`email`/`server_url`/`ca_cert` at
-the top level, no `vaults:` list) still works and means `id: default`.
+the flat single-vault config (`folder`/`collection`/`email`/`server_url`/
+`ca_cert` at the top level, no `vaults:` list) still works and means
+`id: default` (stored `folder: hermes` entries keep resolving as before;
+new vaults get no scope = whole vault until you set one).
 
 **Option C — local Vaultwarden (optional).** Only if you want a vault on
 this box: `cd deploy && docker compose up -d` (loopback TLS via
@@ -182,7 +193,8 @@ hermes  →  os.environ["MY_API_KEY"]   # value came from the vault, never from 
 | `secrets.dropvault.vaults[].id` | required | `[a-z0-9_]+`; `default` keeps legacy `BW_SESSION` + state dir |
 | `secrets.dropvault.vaults[].label` | id | Display name in the dashboard switcher |
 | `secrets.dropvault.vaults[].enabled` | `true` | Per-vault kill switch |
-| `secrets.dropvault.vaults[].folder` | `hermes` | Vault folder whose item names are env vars |
+| `secrets.dropvault.vaults[].folder` | – (whole vault) | Legacy vault folder whose item names are env vars (back-compat; empty = whole vault unless `collection` set) |
+| `secrets.dropvault.vaults[].collection` | – (whole vault) | Bitwarden collection whose items become env vars (needs an org; wins over `folder`; empty = whole vault unless `folder` set) |
 | `secrets.dropvault.vaults[].email` | – | Account email (login fallback + display) |
 | `secrets.dropvault.vaults[].server_url` | – | Vaultwarden URL; empty = don't touch CLI server config |
 | `secrets.dropvault.vaults[].ca_cert` | – | CA bundle for self-signed TLS; omit for public HTTPS |
@@ -191,8 +203,9 @@ hermes  →  os.environ["MY_API_KEY"]   # value came from the vault, never from 
 | `secrets.dropvault.vaults[].session_env` | `BW_SESSION[_<ID>]` | Session var override (rarely needed) |
 | `secrets.dropvault.file_shims[].vault` | default/first | Which vault a file-shim entry reads from |
 
-Legacy flat keys (`secrets.dropvault.folder` / `email` / `server_url` /
-`ca_cert` / `cli_*`, no `vaults:` list) still configure the `default` vault.
+Legacy flat keys (`secrets.dropvault.folder` / `collection` / `email` /
+`server_url` / `ca_cert` / `cli_*`, no `vaults:` list) still configure
+the `default` vault (`folder:` migrates as-is).
 
 ## Files
 

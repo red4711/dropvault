@@ -115,7 +115,8 @@
     const [mLabel, setMLabel] = useState("");
     const [mEmail, setMEmail] = useState("");
     const [mServer, setMServer] = useState("");
-    const [mFolder, setMFolder] = useState("hermes");
+    const [mFolder, setMFolder] = useState(""); // legacy back-compat (optional)
+    const [mCollection, setMCollection] = useState("");
     const [mCa, setMCa] = useState("");
     const [mBusy, setMBusy] = useState(false);
     const [mError, setMError] = useState(null);
@@ -331,14 +332,14 @@
     // ---- Vault roster management (add / edit / remove / enable) ----
     function openAddVault() {
       setMId(""); setMLabel(""); setMEmail("");
-      setMServer("https://"); setMFolder("hermes"); setMCa("");
-      setMError(null); setManageOpen("add");
+      setMServer("https://"); setMFolder(""); setMCollection("");
+      setMCa(""); setMError(null); setManageOpen("add");
     }
     function openEditVault(v) {
       setMId(v.id); setMLabel(v.label && v.label !== v.id ? v.label : "");
       setMEmail(v.email || ""); setMServer(v.server || "");
-      setMFolder(v.folder || "hermes"); setMCa("");
-      setMError(null); setManageOpen({ mode: "edit", id: v.id });
+      setMFolder(v.folder || ""); setMCollection(v.collection || "");
+      setMCa(""); setMError(null); setManageOpen({ mode: "edit", id: v.id });
     }
     function closeManage() {
       if (mBusy) return;
@@ -351,7 +352,8 @@
         const payload = {
           id: mId.trim().toLowerCase(),
           label: mLabel.trim(), email: mEmail.trim(),
-          server_url: mServer.trim(), folder: mFolder.trim() || "hermes",
+          server_url: mServer.trim(),
+          folder: mFolder.trim(), collection: mCollection.trim(),
           ca_cert: mCa.trim(),
         };
         if (manageOpen === "add") {
@@ -461,11 +463,11 @@
     // Badge is rendered inside the vault card (VaultCard); the header no
     // longer shows lock state — HeaderButtons is global actions only.
 
-    // 3 skeleton rows shown while the folder content decrypts/loads.
+    // 3 skeleton rows shown while the scope content decrypts/loads.
     function SecretSkeleton() {
       return h("div", { className: "py-2 space-y-2", "aria-busy": "true" },
         h("div", { className: "flex items-center gap-2 text-sm text-muted-foreground" },
-          h(Spinner, { className: "h-3.5 w-3.5" }), "Decrypting folder contents…"),
+          h(Spinner, { className: "h-3.5 w-3.5" }), "Decrypting vault contents…"),
         [64, 96, 80].map((w, i) =>
           h("div", { key: i, className: "flex items-center justify-between py-2" },
             h("div", { className: "h-4 rounded bg-muted animate-pulse", style: { width: w + "px" } }),
@@ -533,7 +535,11 @@
       const enabled = !meta || meta.enabled !== false;
       const email = (meta && meta.email) || (st && st.email);
       const server = (meta && meta.server) || (st && st.server);
-      const folder = (meta && meta.folder) || (st && st.folder);
+      // Scope: collection wins, else folder, else whole vault.
+      const coll = (meta && meta.collection) || (st && st.collection) || "";
+      const folder = (meta && meta.folder) || (st && st.folder) || "";
+      const scopeClause = (coll ? `Collection “${coll}”` : folder ? `Folder “${folder}”` : "Whole vault")
+        + (secrets ? ` · ${secrets.length} secrets` : "");
       const live = meta ? statusBy[meta.id] : null;
       const ok = live ? !!live.ok : (st ? !!st.ok : !!((meta && meta.ok)));
       const state = (st && st.vault) || (meta && meta.vault) || (ok ? "unlocked" : "locked");
@@ -612,8 +618,7 @@
               busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
             h(Button, { variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
               busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
-            folder && h("span", { className: "text-xs text-muted-foreground" },
-              `Folder "${folder}"` + (secrets ? ` · ${secrets.length} secrets` : ""))),
+            h("span", { className: "text-xs text-muted-foreground" }, scopeClause)),
           st && st.ok && showForm && h("form", { key: "form", onSubmit: doSave, className: "space-y-3 border-t pt-3" },
             h("div", null,
               h(Label, null, "Name (env var)"),
@@ -696,10 +701,15 @@
                 value: mServer, onChange: (e) => setMServer(e.target.value),
                 placeholder: "https://vault.example.com", disabled: mBusy,
               })),
+            h("div", null,
+              h(Label, null, "Collection (optional — needs an org; whole vault when empty)"),
+              h(Input, { value: mCollection, onChange: (e) => setMCollection(e.target.value), placeholder: "hermes", disabled: mBusy }),
+              h("p", { className: "text-xs text-muted-foreground pt-1" },
+                "Bitwarden items an org tags for Hermes. Wins over Folder; best for big vaults.")),
             h("div", { className: "flex gap-2" },
               h("div", { className: "flex-1" },
-                h(Label, null, "Folder"),
-                h(Input, { value: mFolder, onChange: (e) => setMFolder(e.target.value), placeholder: "hermes", disabled: mBusy })),
+                h(Label, null, "Folder (legacy, optional)"),
+                h(Input, { value: mFolder, onChange: (e) => setMFolder(e.target.value), placeholder: "leave empty", disabled: mBusy })),
               h("div", { className: "flex-1" },
                 h(Label, null, "CA cert (self-signed only)"),
                 h(Input, { value: mCa, onChange: (e) => setMCa(e.target.value), placeholder: "omit for public HTTPS", disabled: mBusy }))),

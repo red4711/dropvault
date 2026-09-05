@@ -2,7 +2,8 @@
 
 One VaultHandle owns everything that differs between vaults: the CLI
 state dir (BITWARDENCLI_APPDATA_DIR isolation), the session env var,
-the CA bundle, the server URL, and the folder. Fail-open everywhere:
+the CA bundle, the server URL, and the scope (collection XOR folder XOR
+whole vault). Fail-open everywhere:
 helpers never raise for missing config, only run()/run_json() surface
 spawn problems as RuntimeError per the run_secret_cli contract.
 """
@@ -15,7 +16,27 @@ import shutil
 import subprocess
 from pathlib import Path
 
+# Historical folder name for the pre-scope era; kept so legacy stored
+# entries (`folder: hermes`) and old doc references still resolve.
+# NOT a default — fresh vaults with no scope get the whole vault.
 DEFAULT_FOLDER = "hermes"
+
+# Scope mode: exactly one of these wins per vault (collection > folder).
+SCOPE_COLLECTION = "collection"
+SCOPE_FOLDER = "folder"
+SCOPE_WHOLE_VAULT = "whole"
+
+
+def scope_for(entry: dict) -> tuple:
+    """(mode, name) for a vault entry. Collection wins over folder;
+    neither set (or both blank) = whole vault."""
+    coll = str((entry or {}).get("collection") or "").strip()
+    if coll:
+        return SCOPE_COLLECTION, coll
+    folder = str((entry or {}).get("folder") or "").strip()
+    if folder:
+        return SCOPE_FOLDER, folder
+    return SCOPE_WHOLE_VAULT, ""
 
 _ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
@@ -84,13 +105,18 @@ def session_env_for(vid: str) -> str:
 class VaultHandle:
     """All per-vault bw mechanics for one configured vault."""
 
-    def __init__(self, vid, email="", folder=DEFAULT_FOLDER,
+    def __init__(self, vid, email="", folder="",
                  server_url="", ca_cert="", cli_path="",
                  cli_data_dir="", cli_timeout_seconds=30.0,
-                 session_env=""):
+                 session_env="", collection=""):
         self.vid = vid
         self.email = email or ""
-        self.folder = folder or DEFAULT_FOLDER
+        # Scope: collection XOR folder XOR whole vault. Empty/None means
+        # "not set" — scope_for() decides the winner. No default applied
+        # here: absent scope = whole vault. Legacy 'hermes' folder only
+        # arrives when a stored config entry (or legacy flat key) says so.
+        self.folder = folder if folder else ""
+        self.collection = (collection or "").strip()
         self.server_url = (server_url or "").strip()
         self.ca_cert = ca_cert or ""
         self.cli_path = cli_path or ""
@@ -104,6 +130,12 @@ class VaultHandle:
         self.session_env = session_env or session_env_for(vid)
 
     # ------------------------------------------------------------------ #
+
+    @property
+    def scope(self) -> tuple:
+        """(mode, name) — collection > folder > whole vault."""
+        return scope_for({"collection": self.collection,
+                          "folder": self.folder})
 
     @property
     def state_dir(self) -> Path:
