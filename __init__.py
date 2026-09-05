@@ -137,9 +137,10 @@ class VwVaultSource(SecretSource):
     def __init__(self, handle: VaultHandle | None = None,
                  source_name: str = "", label: str = "",
                  session_env: str = "", folder: str = "",
-                 timeout: float = 30.0):
+                 timeout: float = 30.0, enabled: bool = True):
         # Zero-arg construction (watchdog fallback / old call sites) yields
         # the default vault; _ensure_init fills the rest lazily.
+        self._enabled = bool(enabled)
         if handle is None:
             self._handle = None  # completed by _ensure_init()
             self.name = "dropvault"
@@ -171,6 +172,7 @@ class VwVaultSource(SecretSource):
     def _ensure_init(self):
         if getattr(self, "_handle", None) is not None:
             return
+        self._enabled = getattr(self, "_enabled", True)
         handle = VaultHandle("default", session_env="BW_SESSION")
         self._handle = handle
         self.name = "dropvault"
@@ -301,6 +303,18 @@ class VwVaultSource(SecretSource):
             result.error_kind = ErrorKind.INTERNAL
             return result
 
+    def is_enabled(self, cfg: dict) -> bool:
+        """This instance is one vault; its enabled flag was fixed at build.
+
+        A per-source section (secrets.dropvault_<id>.enabled, or the whole
+        secrets.dropvault section for the lone-default 'dropvault' name)
+        can still turn it off.
+        """
+        self._ensure_init()
+        if isinstance(cfg, dict) and "enabled" in cfg:
+            return self._enabled and bool(cfg["enabled"])
+        return self._enabled
+
     def protected_env_vars(self, cfg: dict) -> FrozenSet[str]:
         self._ensure_init()
         # A vault item named like a session var must never clobber it.
@@ -359,6 +373,7 @@ def _build_sources(dv_cfg: dict) -> List[VwVaultSource]:
             str(entry.get("session_env") or session_env_for(vid)),
             str(entry.get("folder") or DEFAULT_FOLDER),
             timeout,
+            bool(entry.get("enabled", True)),
         ))
     return sources
 
