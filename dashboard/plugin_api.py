@@ -44,13 +44,14 @@ from pydantic import BaseModel
 try:
     from vault_handle import (
         TWO_FACTOR_METHODS,
+        _find_usable_node,
         is_two_factor_challenge,
         login_argv,
     )
 except ImportError:
     # The dashboard loads this file standalone (module
     # hermes_dashboard_plugin_dropvault) with the plugin root NOT on
-    # sys.path — add it so the 2FA helpers stay single-sourced.
+    # sys.path — add it so the helpers stay single-sourced.
     import sys as _sys
 
     _ROOT = Path(__file__).resolve().parent.parent
@@ -58,6 +59,7 @@ except ImportError:
         _sys.path.insert(0, str(_ROOT))
     from vault_handle import (  # noqa: E402
         TWO_FACTOR_METHODS,
+        _find_usable_node,
         is_two_factor_challenge,
         login_argv,
     )
@@ -200,8 +202,16 @@ def _bw_env(cfg: dict, session: str = "") -> dict:
     vid = str((cfg or {}).get("id") or "default")
     session_env = str((cfg or {}).get("session_env")
                       or _session_env_for(vid))
+    node = _find_usable_node()
+    node_dir = os.path.dirname(node) if node else None
+    # Dashboard/systemd PATH lacks ~/.local/bin AND contains a DANGLING
+    # /usr/local/bin/node (-> /root/.hermes, Permission denied): bw's
+    # #!/usr/bin/env node resolves to the broken one -> 'Permission denied'.
+    # Prepend our node dir, strip /usr/local/bin.
+    parts = [p for p in os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(":")
+             if p and p != "/usr/local/bin"]
     env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PATH": (node_dir + ":" + ":".join(parts)) if node_dir else ":".join(parts),
         "HOME": os.environ.get("HOME", str(Path.home())),
         "BW_NOINTERACTION": "true",
         "BITWARDENCLI_APPDATA_DIR": str(_state_dir(

@@ -19,6 +19,29 @@ DEFAULT_FOLDER = "hermes"
 
 _ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
+# Node binary candidates for `bw`'s #!/usr/bin/env node shebang, in order.
+# NOTE: /usr/local/bin/node is a DANGLING symlink to /root/.hermes/...
+# (root-only, Permission denied for us) — it must come LAST, and only
+# when verified executable, or bw fails with "/usr/bin/env: 'node':
+# Permission denied". ~/.local/bin/node (-> ~/.hermes/node) is ours.
+_NODE_CANDIDATES = (
+    os.path.expanduser("~/.local/bin/node"),
+    os.path.expanduser("~/.hermes/node/bin/node"),
+    "/usr/bin/node",
+    "/usr/local/bin/node",
+)
+
+
+def _find_usable_node() -> str | None:
+    """First node candidate that exists AND we can execute."""
+    found = shutil.which("node")
+    if found and os.access(found, os.X_OK):
+        return found
+    for cand in _NODE_CANDIDATES:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
 
 def valid_vault_id(vid: object) -> bool:
     """True when vid matches [a-z0-9_]+ (URL/env/dir safe)."""
@@ -110,13 +133,15 @@ class VaultHandle:
         ca = self.ca_cert
         if ca and os.path.isfile(os.path.expanduser(str(ca))):
             extra["NODE_EXTRA_CA_CERTS"] = str(ca)
-        node = shutil.which("node") or (
-            os.path.expanduser("~/.local/bin/node")
-            if os.path.isfile(os.path.expanduser("~/.local/bin/node")) else None
-        )
+        node = _find_usable_node()
         if node:
-            extra["PATH"] = os.path.dirname(node) + ":" + os.environ.get(
-                "PATH", "/usr/bin:/bin")
+            # Prepend OUR node dir and STRIP dirs that can shadow it with a
+            # broken node: /usr/local/bin/node is a dangling symlink into
+            # /root/.hermes (Permission denied) — leaving it first in PATH
+            # makes #!/usr/bin/env node fail with 'Permission denied'.
+            parts = [p for p in os.environ.get("PATH", "/usr/bin:/bin").split(":")
+                     if p and p != "/usr/local/bin"]
+            extra["PATH"] = os.path.dirname(node) + ":" + ":".join(parts)
         return extra
 
     def resolve_cli(self) -> str | None:

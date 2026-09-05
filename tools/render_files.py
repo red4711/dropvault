@@ -163,15 +163,26 @@ def _bw_env(session: str, cfg: dict, vid: str = "default") -> dict:
         ca = str(DEFAULT_CA_CERT)
     if ca and os.path.isfile(os.path.expanduser(str(ca))):
         env["NODE_EXTRA_CA_CERTS"] = str(ca)
-    # bw is a node script (#!/usr/bin/env node); sanitized child envs
-    # (systemd: PATH without ~/.local/bin) can't spawn it -> exit 126.
-    # Resolve node explicitly like the plugin's VaultHandle does.
-    node = shutil.which("node") or (
-        os.path.expanduser("~/.local/bin/node")
-        if os.path.isfile(os.path.expanduser("~/.local/bin/node")) else None
-    )
+    # bw is a node script (#!/usr/bin/env node). Two hazards in sanitized
+    # envs: (a) systemd PATH lacks ~/.local/bin -> node not found (exit 126);
+    # (b) /usr/local/bin/node is a DANGLING symlink into /root/.hermes
+    # (Permission denied) that shadows the good one. Prepend our node dir,
+    # strip /usr/local/bin.
+    node = shutil.which("node")
+    if not (node and os.access(node, os.X_OK)):
+        node = None
+    if node is None:
+        for cand in (os.path.expanduser("~/.local/bin/node"),
+                     os.path.expanduser("~/.hermes/node/bin/node")):
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                node = cand
+                break
+    parts = [p for p in env.get("PATH", "/usr/bin:/bin").split(":")
+             if p and p != "/usr/local/bin"]
     if node:
-        env["PATH"] = os.path.dirname(node) + ":" + env.get("PATH", "/usr/bin:/bin")
+        env["PATH"] = os.path.dirname(node) + ":" + ":".join(parts)
+    else:
+        env["PATH"] = ":".join(parts)
     return env
 
 
