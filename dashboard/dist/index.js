@@ -485,45 +485,67 @@
 
     // Header button cluster: per-vault Lock/Sync + global Sync env +
     // a vault counter that opens the add/edit/remove manager.
+    // All labels are whitespace-nowrap: this skin's wide letter-spacing
+    // wraps two-word labels ("Sync env") onto two lines, making those
+    // buttons taller than their siblings.
     function HeaderButtons() {
       const n = (!legacy && vaults) ? vaults.length : (status ? 1 : 0);
-      return h("div", { className: "flex items-center gap-2" }, statusBadge,
-        status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
+      const nb = "whitespace-nowrap";
+      return h("div", { className: "flex items-center gap-2 flex-wrap" }, statusBadge,
+        status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy, className: nb },
           busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
-        status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy },
+        status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
           busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
-        status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy },
+        status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy, className: nb },
           busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"),
         vaults !== null && h(Button, {
           key: "vaults", variant: "outline", size: "sm",
-          onClick: openAddVault, disabled: busy,
+          onClick: openAddVault, disabled: busy, className: nb,
           title: n <= 1 ? "Add a vault" : `${n} vaults — add or manage`,
         }, `Vaults${n > 1 ? ` (${n})` : ""} +`));
     }
 
-    // Selected-vault context line with inline Edit + enable toggle.
-    function VaultContext() {
-      if (!multi || !selMeta) return null;
-      const enabled = selMeta.enabled !== false;
-      return h("div", { key: "vctx", className: "-mt-3 flex items-center gap-2 flex-wrap" },
-        h("p", { className: "text-sm text-muted-foreground" },
-          ["Vault: " + selLabel,
-            selMeta.email ? selMeta.email : null,
-            selMeta.server ? selMeta.server : null,
-            selMeta.folder ? `folder "${selMeta.folder}"` : null,
-            !enabled ? "disabled" : null,
-          ].filter(Boolean).join(" · ")),
-        h(Button, {
-          key: "edit", variant: "ghost", size: "sm",
-          onClick: () => openEditVault(selMeta), disabled: busy,
-          className: "h-6 px-2 text-xs",
-        }, "Edit"),
-        h(Button, {
-          key: "toggle", variant: "ghost", size: "sm",
-          onClick: () => doToggleVault(selMeta), disabled: busy,
-          className: "h-6 px-2 text-xs",
-          title: enabled ? "Stop pulling secrets from this vault" : "Resume pulling secrets from this vault",
-        }, enabled ? "Disable" : "Enable"));
+    // Vault identity card — always rendered once roster/status loads, so
+    // even a single vault sits in a visual container with its connection
+    // details (account email, server, folder). Edit/Disable live here,
+    // next to the vault they affect. In multi mode the tab strip above
+    // switches selection; the card always shows the selected vault.
+    function VaultCard() {
+      const meta = legacy ? null : selMeta;
+      const st = status;
+      if (!meta && !st) return null;
+      const label = meta ? (meta.label || meta.id) : "Vault";
+      const enabled = !meta || meta.enabled !== false;
+      const email = (meta && meta.email) || (st && st.email);
+      const server = (meta && meta.server) || (st && st.server);
+      const folder = (meta && meta.folder) || (st && st.folder);
+      const live = meta ? statusBy[meta.id] : null;
+      const ok = live ? !!live.ok : (st ? !!st.ok : !!((meta && meta.ok)));
+      const state = (st && st.vault) || (meta && meta.vault) || (ok ? "unlocked" : "locked");
+      return h(Card, { key: "vcard" },
+        h(CardContent, { className: "py-4 space-y-2" },
+          h("div", { className: "flex items-center gap-2 flex-wrap" },
+            h(LockDot, { ok }),
+            h("span", { className: "font-medium" }, label),
+            ok ? h(Badge, { key: "b" }, "unlocked")
+               : h(Badge, { key: "b", variant: "destructive" }, state),
+            !enabled && h(Badge, { key: "d", variant: "outline" }, "disabled"),
+            h("span", { className: "flex-1", key: "sp" }),
+            meta && h(Button, {
+              key: "edit", variant: "ghost", size: "sm",
+              onClick: () => openEditVault(meta), disabled: busy,
+              className: "h-7 px-2 text-xs whitespace-nowrap",
+            }, "Edit"),
+            meta && h(Button, {
+              key: "toggle", variant: "ghost", size: "sm",
+              onClick: () => doToggleVault(meta), disabled: busy,
+              className: "h-7 px-2 text-xs whitespace-nowrap",
+              title: enabled ? "Stop pulling secrets from this vault" : "Resume pulling secrets from this vault",
+            }, enabled ? "Disable" : "Enable")),
+          (email || server) && h("p", { key: "conn", className: "text-sm text-muted-foreground" },
+            [email, server].filter(Boolean).join(" · ")),
+          folder && h("p", { key: "fld", className: "text-xs text-muted-foreground" },
+            `Folder "${folder}"` + (secrets && st && st.ok ? ` · ${secrets.length} secrets` : ""))));
     }
 
     // Add/edit vault dialog + remove confirmation.
@@ -608,7 +630,7 @@
 
       h(VaultTabs),
 
-      h(VaultContext),
+      h(VaultCard),
       h(ManageDialog),
 
       error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" },
@@ -623,7 +645,7 @@
       // unlock form (selected vault only)
       status && !status.ok && h(Card, { key: "u" },
         h(CardContent, { className: "py-4" },
-          h("form", { onSubmit: doUnlock, className: "flex gap-2 items-end" },
+          h("form", { onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
             h("div", { className: "flex-1 space-y-3" },
               h("div", null,
                 h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
@@ -649,7 +671,7 @@
                     onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
                     placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
                   })))),
-            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code) },
+            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code), className: "whitespace-nowrap" },
               unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
               unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock")))),
 
