@@ -1,9 +1,16 @@
 /**
- * Dropvault — Dashboard Plugin
+ * Dropvault — Dashboard Plugin (N-vault)
  *
- * Secret drop-in UI backed by the local Vaultwarden. Lists env-var secret
+ * Secret drop-in UI backed by Vaultwarden. Lists env-var secret
  * names (never values), and offers a form to add/update one secret.
  * Talks to /api/plugins/dropvault/.
+ *
+ * Multi-vault: on load GET /vaults; one vault renders exactly the
+ * legacy single-vault UI (vault id passed silently); N vaults render
+ * a tab/pill switcher with per-vault lock dots, unlock forms, and
+ * secret lists. All calls carry the selected vault id
+ * (GET ?vid=, POST {vault: id}); POST /sync-env stays global.
+ * Falls back to the legacy no-vault calls if /vaults 404s (old backend).
  *
  * Plain IIFE, no build step. Uses window.__HERMES_PLUGIN_SDK__.
  */
@@ -35,6 +42,20 @@
     });
   }
 
+  // GET helper: appends ?vid= unless vid is null (legacy backend mode).
+  function apiGet(path, vid) {
+    if (vid === null || vid === undefined) return api(path);
+    const sep = path.indexOf("?") === -1 ? "?" : "&";
+    return api(path + sep + "vid=" + encodeURIComponent(vid));
+  }
+
+  // POST helper: merges {vault: id} into the JSON body unless legacy mode.
+  function apiPost(path, vid, payload, opts) {
+    const body = Object.assign({}, payload);
+    if (vid !== null && vid !== undefined) body.vault = vid;
+    return api(path, Object.assign({ method: "POST", body: JSON.stringify(body) }, opts));
+  }
+
   // Small inline spinner (currentColor), sized via className.
   function Spinner({ className }) {
     return h("svg", {
@@ -50,12 +71,34 @@
     }));
   }
 
+  // Lock-state dot: green = unlocked, red = locked/unknown.
+  function LockDot({ ok }) {
+    return h("span", {
+      className: cn("inline-block h-2 w-2 rounded-full shrink-0",
+        ok ? "bg-emerald-500" : "bg-red-500"),
+      "aria-label": ok ? "unlocked" : "locked",
+      title: ok ? "unlocked" : "locked",
+    });
+  }
+
   function App() {
-    const [status, setStatus] = useState(null);
-    const [secrets, setSecrets] = useState(null);
-    const [error, setError] = useState(null);
-    const [notice, setNotice] = useState(null);
-    const [pw, setPw] = useState("");
+    // vaults: null = loading, [] = legacy backend (no /vaults route),
+    // else [{id, label, ok, vault, email, server, folder}]
+    const [vaults, setVaults] = useState(null);
+    const [sel, setSel] = useState(null);
+    // Per-vault state, keyed by vault id.
+    const [statusBy, setStatusBy] = useState({});
+    const [secretsBy, setSecretsBy] = useState({});
+    const [errorBy, setErrorBy] = useState({});
+    const [noticeBy, setNoticeBy] = useState({});
+    const [pwBy, setPwBy] = useState({});
+    // Legacy single-vault state (used only when /vaults 404s).
+    const [legacyStatus, setLegacyStatus] = useState(null);
+    const [legacySecrets, setLegacySecrets] = useState(null);
+    const [legacyError, setLegacyError] = useState(null);
+    const [legacyNotice, setLegacyNotice] = useState(null);
+    const [legacyPw, setLegacyPw] = useState("");
+    // Shared form / busy state (reset on vault switch).
     const [name, setName] = useState("");
     const [value, setValue] = useState("");
     const [busy, setBusy] = useState(false);
@@ -63,32 +106,121 @@
     const [showForm, setShowForm] = useState(false);
     const [editName, setEditName] = useState(null);
 
-    const refresh = useCallback(async () => {
-      setError(null);
+    const legacy = vaults !== null && vaults.length === 0;
+    const multi = !legacy && vaults !== null && vaults.length > 1;
+    const status = legacy ? legacyStatus : (sel ? statusBy[sel] || null : null);
+    const secrets = legacy ? legacySecrets : (sel ? secretsBy[sel] || null : null);
+    const error = legacy ? legacyError : (sel ? errorBy[sel] || null : null);
+    const notice = legacy ? legacyNotice : (sel ? noticeBy[sel] || null : null);
+    const pw = legacy ? legacyPw : (sel ? (pwBy[sel] || "") : "");
+    const setPw = legacy
+      ? setLegacyPw
+      : (v) => setPwBy((m) => Object.assign({}, m, { [sel]: v }));
+    const setError = legacy
+      ? setLegacyError
+      : (v) => setErrorBy((m) => Object.assign({}, m, { [sel]: v }));
+    const setNotice = legacy
+      ? setLegacyNotice
+      : (v) => setNoticeBy((m) => Object.assign({}, m, { [sel]: v }));
+
+    // Effective vault id for API calls: null in legacy mode.
+    const vid = legacy ? null : sel;
+
+    const refreshOne = useCallback(async (id) => {
+      if (id === null) {
+        // Legacy backend: unsuffixed routes.
+        setLegacyError(null);
+        try {
+          const st = await api("/status");
+          setLegacyStatus(st);
+          if (st.ok) {
+            setLegacySecrets(null);
+            const s = await api("/secrets");
+            setLegacySecrets(s.secrets);
+          } else {
+            setLegacySecrets(null);
+          }
+        } catch (e) {
+          setLegacyError(e.message);
+        }
+        return;
+      }
+      setErrorBy((m) => Object.assign({}, m, { [id]: null }));
       try {
-        const st = await api("/status");
-        setStatus(st);
+        const st = await apiGet("/status", id);
+        setStatusBy((m) => Object.assign({}, m, { [id]: st }));
         if (st.ok) {
-          setSecrets(null); // show loading skeleton while the folder decrypts
-          const s = await api("/secrets");
-          setSecrets(s.secrets);
+          // Show loading skeleton while the folder decrypts.
+          setSecretsBy((m) => Object.assign({}, m, { [id]: null }));
+          const s = await apiGet("/secrets", id);
+          setSecretsBy((m) => Object.assign({}, m, { [id]: s.secrets }));
         } else {
-          setSecrets(null);
+          setSecretsBy((m) => Object.assign({}, m, { [id]: null }));
         }
       } catch (e) {
-        setError(e.message);
+        setErrorBy((m) => Object.assign({}, m, { [id]: e.message }));
       }
     }, []);
 
+    // Refresh the /vaults roster (lock dots) without wiping per-vault data.
+    const refreshVaults = useCallback(async () => {
+      try {
+        const v = await api("/vaults");
+        const list = v.vaults || v;
+        setVaults(list);
+        return list;
+      } catch (e) {
+        if (/not found|404/i.test(e.message || "")) {
+          setVaults([]); // legacy backend
+          return [];
+        }
+        throw e;
+      }
+    }, []);
+
+    const refresh = useCallback(async () => {
+      try {
+        const list = await refreshVaults();
+        if (list.length === 0) {
+          await refreshOne(null);
+        } else {
+          // Keep selection stable; default to first unlocked, else first.
+          setSel((cur) => {
+            const ids = list.map((x) => x.id);
+            if (cur && ids.indexOf(cur) !== -1) { refreshOne(cur); return cur; }
+            const unlocked = list.find((x) => x.ok);
+            const next = (unlocked || list[0]).id;
+            refreshOne(next);
+            return next;
+          });
+        }
+      } catch (e) {
+        // /vaults itself failed (gateway down?): surface globally on selection.
+        setVaults([]);
+        setLegacyError(e.message);
+      }
+    }, [refreshOne, refreshVaults]);
+
     useEffect(() => { refresh(); }, [refresh]);
+
+    function selectVault(id) {
+      if (id === sel) return;
+      // Reset shared form state so drafts never leak across vaults.
+      setShowForm(false); setEditName(null); setName(""); setValue("");
+      setUnlocking(false); setBusy(false);
+      setSel(id);
+      // Lazily load vaults never opened this session.
+      if (statusBy[id] === undefined) refreshOne(id);
+    }
 
     async function doUnlock(e) {
       e.preventDefault();
       setUnlocking(true); setError(null);
       try {
-        await api("/unlock", { method: "POST", body: JSON.stringify({ password: pw }) });
+        await apiPost("/unlock", vid, { password: pw });
         setPw("");
-        await refresh();
+        await refreshOne(vid);
+        await refreshVaults().catch(() => {});
       } catch (e2) {
         setError(e2.message);
       } finally { setUnlocking(false); }
@@ -97,17 +229,18 @@
     async function doLock() {
       setBusy(true);
       try {
-        await api("/lock", { method: "POST", body: "{}" });
-        await refresh();
+        await apiPost("/lock", vid, {});
+        await refreshOne(vid);
+        await refreshVaults().catch(() => {});
       } finally { setBusy(false); }
     }
 
     async function doSync() {
       setBusy(true); setNotice(null);
       try {
-        await api("/sync", { method: "POST", body: "{}" });
+        await apiPost("/sync", vid, {});
         setNotice("Vault cache synced from the server. Add or update secrets, then press Sync env to push them into the running tools.");
-        await refresh();
+        await refreshOne(vid);
       } catch (e) {
         setError(e.message);
       } finally { setBusy(false); }
@@ -116,9 +249,10 @@
     async function doSyncEnv() {
       setBusy(true); setNotice(null);
       try {
+        // Global: gateway-wide re-apply, no vault scoping.
         await api("/sync-env", { method: "POST", body: "{}" });
         setNotice("Sync requested — the gateway applies vault secrets to its environment (and file shims) within ~5 seconds.");
-        await refresh();
+        await refreshOne(vid);
       } catch (e) {
         setError(e.message);
       } finally { setBusy(false); }
@@ -137,19 +271,21 @@
       e.preventDefault();
       setBusy(true); setError(null);
       try {
-        const r = await api("/secrets", {
-          method: "POST",
-          body: JSON.stringify({ name, value }),
-        });
+        const r = await apiPost("/secrets", vid, { name, value });
         setNotice(r.created
           ? `Created ${r.name}.`
           : `Updated ${r.name}.`);
         setValue(""); setShowForm(false);
-        await refresh();
+        await refreshOne(vid);
       } catch (e2) {
         setError(e2.message);
       } finally { setBusy(false); }
     }
+
+    const selMeta = !legacy && sel
+      ? (vaults || []).find((v) => v.id === sel) || null
+      : null;
+    const selLabel = legacy ? null : (selMeta && (selMeta.label || selMeta.id)) || sel;
 
     const statusBadge = !status ? h(Spinner, { className: "h-4 w-4 text-muted-foreground" }) :
       status.ok ? h(Badge, { key: "b" }, "unlocked") :
@@ -166,13 +302,42 @@
             h("div", { className: "h-4 w-14 rounded bg-muted animate-pulse" }))));
     }
 
+    // Vault tab strip — rendered only when 2+ vaults exist, so a
+    // single vault looks exactly like the legacy UI.
+    function VaultTabs() {
+      if (!multi) return null;
+      return h("div", {
+        key: "vaults",
+        className: "flex flex-wrap gap-2",
+        role: "tablist",
+        "aria-label": "Vaults",
+      }, vaults.map((v) => {
+        const active = v.id === sel;
+        // Prefer live per-vault status; fall back to the /vaults roster flag.
+        const live = statusBy[v.id];
+        const ok = live ? !!live.ok : !!v.ok;
+        return h(Button, {
+          key: v.id,
+          role: "tab",
+          "aria-selected": active ? "true" : "false",
+          variant: active ? "default" : "outline",
+          size: "sm",
+          onClick: () => selectVault(v.id),
+          className: "gap-2",
+          title: [v.email, v.server].filter(Boolean).join(" · ") || v.id,
+        }, h(LockDot, { ok }), v.label || v.id);
+      }));
+    }
+
     return h("div", { className: "p-6 space-y-6 max-w-3xl mx-auto" },
       // header
       h("div", { className: "flex items-center justify-between" },
         h("div", null,
           h("h1", { className: "text-2xl font-semibold" }, "Dropvault"),
           h("p", { className: "text-sm text-muted-foreground" },
-            "Secrets in the local Vaultwarden — values never enter chat or logs.")),
+            multi
+              ? `Secrets in ${vaults.length} Vaultwarden vaults — values never enter chat or logs.`
+              : "Secrets in the local Vaultwarden — values never enter chat or logs.")),
         h("div", { className: "flex items-center gap-2" }, statusBadge,
           status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
             busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
@@ -181,20 +346,31 @@
           status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy },
             busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"))),
 
-      error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" }, error)),
+      h(VaultTabs),
+
+      // Selected-vault context line (multi mode only).
+      multi && selMeta && h("p", { key: "vctx", className: "text-sm text-muted-foreground -mt-3" },
+        ["Vault: " + selLabel,
+          selMeta.email ? selMeta.email : null,
+          selMeta.server ? selMeta.server : null,
+          selMeta.folder ? `folder "${selMeta.folder}"` : null,
+        ].filter(Boolean).join(" · ")),
+
+      error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" },
+        multi && !legacy ? `Vault “${selLabel}”: ${error}` : error)),
       notice && h(Card, { key: "ok" }, h(CardContent, { className: "text-sm text-muted-foreground py-3" }, notice)),
 
       // initial status check
-      !status && h(Card, { key: "st" },
+      !status && !error && h(Card, { key: "st" },
         h(CardContent, { className: "py-6 flex items-center justify-center gap-2 text-sm text-muted-foreground" },
           h(Spinner, { className: "h-4 w-4" }), "Checking vault status…")),
 
-      // unlock form
+      // unlock form (selected vault only)
       status && !status.ok && h(Card, { key: "u" },
         h(CardContent, { className: "py-4" },
           h("form", { onSubmit: doUnlock, className: "flex gap-2 items-end" },
             h("div", { className: "flex-1" },
-              h(Label, null, "Master password"),
+              h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
               h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
                          placeholder: "vault master password", autoFocus: true, disabled: unlocking })),
             h(Button, { type: "submit", disabled: unlocking || !pw },
