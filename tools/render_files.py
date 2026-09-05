@@ -128,10 +128,13 @@ def _get_session(session_env: str = LEGACY_SESSION_ENV) -> str:
     sess = (os.environ.get(session_env) or "").strip()
     if sess:
         return sess
-    if session_env != LEGACY_SESSION_ENV:
-        # Fall back to the process env's legacy var only for the default
-        # vault (migration path); never cross-read another vault's session.
-        pass
+    # Dashboard/systemd children often lack the .env in their process env
+    # (they read it from disk); the file is the canonical bootstrap store.
+    # Never cross-read another vault's session var.
+    if session_env == LEGACY_SESSION_ENV:
+        legacy = (os.environ.get("BW_SESSION") or "").strip()
+        if legacy:
+            return legacy
     try:
         for line in HERMES_ENV.read_text().splitlines():
             if line.startswith(session_env + "="):
@@ -153,8 +156,11 @@ def _bw_env(session: str, cfg: dict, vid: str = "default") -> dict:
     env["BITWARDENCLI_APPDATA_DIR"] = str(_vault_state_dir(
         vid, str((cfg or {}).get("cli_data_dir") or "")))
     ca = (cfg or {}).get("ca_cert")
-    if ca is None and vid == "default":
-        ca = str(DEFAULT_CA_CERT)  # legacy default-CA path, default vault only
+    if ca is None:
+        # Default-CA path: the historical install always had ~/vw-certs/ca.crt
+        # for the loopback vault; harmless for public-HTTPS vaults (file
+        # simply won't exist there) and keeps legacy configs working.
+        ca = str(DEFAULT_CA_CERT)
     if ca and os.path.isfile(os.path.expanduser(str(ca))):
         env["NODE_EXTRA_CA_CERTS"] = str(ca)
     node = shutil.which("node")
@@ -174,15 +180,17 @@ def _maybe_b64_decode(s: str) -> str:
         return s
 
 
-def fetch_vault_secrets(cfg: dict, vid: str = "default") -> dict | None:
+def fetch_vault_secrets(cfg: dict, vid: str = "default",
+                      session: str | None = None) -> dict | None:
     """Return {name: value} or None when the vault is unavailable (fail-open).
 
     None = locked / not configured / binary missing / network error.
     Never raises, never logs values.
     """
-    session_env = str((cfg or {}).get("session_env")
-                      or _session_env_for(vid))
-    session = _get_session(session_env)
+    if not session:
+        session_env = str((cfg or {}).get("session_env")
+                          or _session_env_for(vid))
+        session = _get_session(session_env)
     if not session:
         return None
     cli = _resolve_bw(cfg)
@@ -383,7 +391,8 @@ def _default_vault_id(vaults: list) -> str:
     return ids[0] if ids else "default"
 
 
-def render_all(secrets: dict | None = None) -> list[dict]:
+def render_all(secrets: dict | None = None,
+               session: str | None = None) -> list[dict]:
     """Render every configured shim. Returns per-target report dicts.
 
     Each report: {target, format, changed, mode_fixed, skipped, missing}.
@@ -419,7 +428,8 @@ def render_all(secrets: dict | None = None) -> list[dict]:
         per_vault: dict[str, dict | None] = {}
         for vid in want:
             try:
-                per_vault[vid] = fetch_vault_secrets(by_id[vid], vid)
+                per_vault[vid] = fetch_vault_secrets(by_id[vid], vid,
+                                                     session=session)
             except Exception:
                 per_vault[vid] = None
         live = {vid: s for vid, s in per_vault.items() if s is not None}

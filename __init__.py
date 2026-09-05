@@ -401,11 +401,14 @@ def register(ctx):
 # Auto-sync watchdog (opt-out via secrets.dropvault.auto_sync_minutes: 0)
 # ---------------------------------------------------------------------------
 
-def _maybe_render_file_shims() -> None:
+def _maybe_render_file_shims(session: str | None = None) -> None:
     """Render vault-managed files for non-Hermes consumers (fail-open).
 
     Loads dropvault/tools/render_files.py (plugin-relative first, then the
-    workspace copy) and calls render_all(). Never raises; never logs values.
+    workspace copy) and calls render_all(). When the caller already holds
+    a live session (startup hydration just unlocked the vault), it is
+    passed through so the render doesn't depend on the child process env.
+    Never raises; never logs values.
     """
     import importlib.util
     rlog = logging.getLogger("dropvault.file-shims")
@@ -421,7 +424,10 @@ def _maybe_render_file_shims() -> None:
             "dropvault_render_files", str(script))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        reports = mod.render_all()
+        try:
+            reports = mod.render_all(session=session)
+        except TypeError:
+            reports = mod.render_all()  # older render_files without session passthrough
         changed = sum(1 for r in reports if r.get("changed"))
         rlog.info("file shims rendered: %d targets, %d changed",
                   len(reports), changed)
@@ -526,7 +532,12 @@ def _auto_sync_loop(mins: int) -> None:
                 _apply_external_secret_sources(Path.home())
                 wlog.info("dropvault auto-sync: changed vault re-applied to env")
                 try:
-                    _maybe_render_file_shims()
+                    # _apply_external_secret_sources put BW_SESSION into
+                    # os.environ — hand it through (render thread env may
+                    # not otherwise see it).
+                    import os as _os
+                    _maybe_render_file_shims(
+                        session=(_os.environ.get("BW_SESSION") or "").strip() or None)
                 except Exception:
                     pass  # render is fail-open; never crash the loop
         except Exception:
@@ -548,11 +559,23 @@ def _start_auto_sync() -> None:
     threading.Thread(target=_auto_sync_loop, args=(mins,),
                      name="dropvault-auto-sync", daemon=True).start()
     # One-shot render shortly after startup hydration (fail-open, guarded).
+    # Session passthrough: the render thread's env may lack BW_SESSION
+    # (systemd children don't inherit the .env file), so read the .env
+    # sessions directly and hand the default vault's to the renderer.
     def _delayed_startup_render() -> None:
         import time
         time.sleep(45)
         try:
-            _maybe_render_file_shims()
+            session = None
+            try:
+                env_file = Path.home() / ".hermes" / ".env"
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("BW_SESSION="):
+                        session = line.partition("=")[2].strip() or None
+                        break
+            except OSError:
+                pass
+            _maybe_render_file_shims(session=session)
         except Exception:
             pass
     threading.Thread(target=_delayed_startup_render,
