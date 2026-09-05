@@ -163,7 +163,13 @@ def _bw_env(session: str, cfg: dict, vid: str = "default") -> dict:
         ca = str(DEFAULT_CA_CERT)
     if ca and os.path.isfile(os.path.expanduser(str(ca))):
         env["NODE_EXTRA_CA_CERTS"] = str(ca)
-    node = shutil.which("node")
+    # bw is a node script (#!/usr/bin/env node); sanitized child envs
+    # (systemd: PATH without ~/.local/bin) can't spawn it -> exit 126.
+    # Resolve node explicitly like the plugin's VaultHandle does.
+    node = shutil.which("node") or (
+        os.path.expanduser("~/.local/bin/node")
+        if os.path.isfile(os.path.expanduser("~/.local/bin/node")) else None
+    )
     if node:
         env["PATH"] = os.path.dirname(node) + ":" + env.get("PATH", "/usr/bin:/bin")
     return env
