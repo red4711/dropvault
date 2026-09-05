@@ -109,6 +109,17 @@
     const [unlocking, setUnlocking] = useState(false);
     const [showForm, setShowForm] = useState(false);
     const [editName, setEditName] = useState(null);
+    // Vault add/edit/remove dialog state.
+    const [manageOpen, setManageOpen] = useState(false); // false | "add" | {mode:"edit", id}
+    const [mId, setMId] = useState("");
+    const [mLabel, setMLabel] = useState("");
+    const [mEmail, setMEmail] = useState("");
+    const [mServer, setMServer] = useState("");
+    const [mFolder, setMFolder] = useState("hermes");
+    const [mCa, setMCa] = useState("");
+    const [mBusy, setMBusy] = useState(false);
+    const [mError, setMError] = useState(null);
+    const [confirmRemove, setConfirmRemove] = useState(null); // vault id | null
 
     const legacy = vaults !== null && vaults.length === 0;
     const multi = !legacy && vaults !== null && vaults.length > 1;
@@ -298,6 +309,107 @@
       } finally { setBusy(false); }
     }
 
+    // ---- Vault roster management (add / edit / remove / enable) ----
+    function openAddVault() {
+      setMId(""); setMLabel(""); setMEmail("");
+      setMServer("https://"); setMFolder("hermes"); setMCa("");
+      setMError(null); setManageOpen("add");
+    }
+    function openEditVault(v) {
+      setMId(v.id); setMLabel(v.label && v.label !== v.id ? v.label : "");
+      setMEmail(v.email || ""); setMServer(v.server || "");
+      setMFolder(v.folder || "hermes"); setMCa("");
+      setMError(null); setManageOpen({ mode: "edit", id: v.id });
+    }
+    function closeManage() {
+      if (mBusy) return;
+      setManageOpen(false); setMError(null); setConfirmRemove(null);
+    }
+    async function doSaveVault(e) {
+      e.preventDefault();
+      setMBusy(true); setMError(null);
+      try {
+        const payload = {
+          id: mId.trim().toLowerCase(),
+          label: mLabel.trim(), email: mEmail.trim(),
+          server_url: mServer.trim(), folder: mFolder.trim() || "hermes",
+          ca_cert: mCa.trim(),
+        };
+        if (manageOpen === "add") {
+          const r = await api("/vaults", { method: "POST", body: JSON.stringify(payload) });
+          setManageOpen(false);
+          setNotice(`Vault “${r.id}” added — unlock it to start pulling secrets.`);
+          const list = await refreshVaults().catch(() => null);
+          if (list) {
+            setSel(r.id);
+            await refreshOne(r.id);
+          }
+        } else {
+          const id = manageOpen.id;
+          await fetch(API + "/vaults/" + encodeURIComponent(id), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify(payload),
+          }).then(async (r) => {
+            const body = await r.json().catch(() => ({}));
+            if (!r.ok) throw new Error(body.detail || r.statusText);
+            return body;
+          });
+          setManageOpen(false);
+          setNotice(`Vault “${id}” updated — takes effect within seconds, no restart needed.`);
+          await refreshVaults().catch(() => {});
+          await refreshOne(id);
+        }
+      } catch (e2) {
+        setMError(e2.message);
+      } finally { setMBusy(false); }
+    }
+    async function doRemoveVault(id) {
+      setMBusy(true); setMError(null);
+      try {
+        await fetch(API + "/vaults/" + encodeURIComponent(id), {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: "{}",
+        }).then(async (r) => {
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.detail || r.statusText);
+          return body;
+        });
+        setConfirmRemove(null); setManageOpen(false);
+        setNotice(`Vault “${id}” removed — its session was forgotten.`);
+        const list = await refreshVaults().catch(() => null);
+        if (list && list.length) {
+          const next = list[0].id;
+          setSel(next);
+          await refreshOne(next);
+        }
+      } catch (e2) {
+        setMError(e2.message);
+      } finally { setMBusy(false); }
+    }
+    async function doToggleVault(v) {
+      setBusy(true);
+      try {
+        await fetch(API + "/vaults/" + encodeURIComponent(v.id), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ id: v.id, enabled: !(v.enabled !== false) }),
+        }).then(async (r) => {
+          const body = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(body.detail || r.statusText);
+          return body;
+        });
+        await refreshVaults().catch(() => {});
+        await refreshOne(v.id);
+      } catch (e) {
+        setError((multi && !legacy ? `Vault “${selLabel}”: ` : "") + e.message);
+      } finally { setBusy(false); }
+    }
+
     function openNew() {
       setEditName(null); setName(""); setValue("");
       setShowForm(true);
@@ -343,7 +455,8 @@
     }
 
     // Vault tab strip — rendered only when 2+ vaults exist, so a
-    // single vault looks exactly like the legacy UI.
+    // single vault looks exactly like the legacy UI (plus one
+    // vault counter button that opens management).
     function VaultTabs() {
       if (!multi) return null;
       return h("div", {
@@ -356,6 +469,7 @@
         // Prefer live per-vault status; fall back to the /vaults roster flag.
         const live = statusBy[v.id];
         const ok = live ? !!live.ok : !!v.ok;
+        const enabled = v.enabled !== false;
         return h(Button, {
           key: v.id,
           role: "tab",
@@ -363,10 +477,122 @@
           variant: active ? "default" : "outline",
           size: "sm",
           onClick: () => selectVault(v.id),
-          className: "gap-2",
-          title: [v.email, v.server].filter(Boolean).join(" · ") || v.id,
+          className: "gap-2" + (enabled ? "" : " opacity-50"),
+          title: [v.email, v.server, !enabled ? "disabled" : null].filter(Boolean).join(" · ") || v.id,
         }, h(LockDot, { ok }), v.label || v.id);
       }));
+    }
+
+    // Header button cluster: per-vault Lock/Sync + global Sync env +
+    // a vault counter that opens the add/edit/remove manager.
+    function HeaderButtons() {
+      const n = (!legacy && vaults) ? vaults.length : (status ? 1 : 0);
+      return h("div", { className: "flex items-center gap-2" }, statusBadge,
+        status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
+          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
+        status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy },
+          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
+        status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy },
+          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"),
+        vaults !== null && h(Button, {
+          key: "vaults", variant: "outline", size: "sm",
+          onClick: openAddVault, disabled: busy,
+          title: n <= 1 ? "Add a vault" : `${n} vaults — add or manage`,
+        }, `Vaults${n > 1 ? ` (${n})` : ""} +`));
+    }
+
+    // Selected-vault context line with inline Edit + enable toggle.
+    function VaultContext() {
+      if (!multi || !selMeta) return null;
+      const enabled = selMeta.enabled !== false;
+      return h("div", { key: "vctx", className: "-mt-3 flex items-center gap-2 flex-wrap" },
+        h("p", { className: "text-sm text-muted-foreground" },
+          ["Vault: " + selLabel,
+            selMeta.email ? selMeta.email : null,
+            selMeta.server ? selMeta.server : null,
+            selMeta.folder ? `folder "${selMeta.folder}"` : null,
+            !enabled ? "disabled" : null,
+          ].filter(Boolean).join(" · ")),
+        h(Button, {
+          key: "edit", variant: "ghost", size: "sm",
+          onClick: () => openEditVault(selMeta), disabled: busy,
+          className: "h-6 px-2 text-xs",
+        }, "Edit"),
+        h(Button, {
+          key: "toggle", variant: "ghost", size: "sm",
+          onClick: () => doToggleVault(selMeta), disabled: busy,
+          className: "h-6 px-2 text-xs",
+          title: enabled ? "Stop pulling secrets from this vault" : "Resume pulling secrets from this vault",
+        }, enabled ? "Disable" : "Enable"));
+    }
+
+    // Add/edit vault dialog + remove confirmation.
+    function ManageDialog() {
+      if (!manageOpen) return null;
+      const isAdd = manageOpen === "add";
+      const idInput = isAdd
+        ? h("div", null,
+            h(Label, null, "ID (lowercase, digits, underscore)"),
+            h(Input, {
+              value: mId, onChange: (e) => setMId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "")),
+              placeholder: "primary", autoFocus: true, disabled: mBusy,
+            }))
+        : h("div", null,
+            h(Label, null, "ID"),
+            h(Input, { value: manageOpen.id, disabled: true }));
+      const removeZone = !isAdd && h("div", { className: "border-t pt-3 mt-1" },
+        confirmRemove !== manageOpen.id
+          ? h(Button, {
+              variant: "ghost", size: "sm", disabled: mBusy,
+              onClick: () => setConfirmRemove(manageOpen.id),
+              className: "text-destructive",
+            }, "Remove this vault…")
+          : h("div", { className: "space-y-2" },
+              h("p", { className: "text-sm text-muted-foreground" },
+                `Remove vault “${manageOpen.id}”? Its session is forgotten; local CLI cache is kept so re-adding resumes instantly.`),
+              h("div", { className: "flex gap-2 justify-end" },
+                h(Button, { variant: "ghost", size: "sm", disabled: mBusy, onClick: () => setConfirmRemove(null) }, "Keep"),
+                h(Button, {
+                  variant: "destructive", size: "sm", disabled: mBusy,
+                  onClick: () => doRemoveVault(manageOpen.id),
+                }, mBusy && h(Spinner, { className: "h-4 w-4 mr-2" }), "Remove vault"))));
+      return h(Card, { key: "manage" },
+        h(CardContent, { className: "py-4" },
+          h("form", { onSubmit: doSaveVault, className: "space-y-3" },
+            h("h2", { className: "text-lg font-medium" },
+              isAdd ? "Add a vault" : `Edit vault “${manageOpen.id}”`),
+            h("p", { className: "text-sm text-muted-foreground" },
+              isAdd
+                ? "Point at any reachable Vaultwarden / Bitwarden server — no local container needed. Unlock it next to start pulling secrets."
+                : "Connection fields only — sessions and secrets are never touched here."),
+            mError && h("p", { className: "text-sm text-destructive" }, mError),
+            idInput,
+            h("div", null,
+              h(Label, null, "Label (display name, optional)"),
+              h(Input, { value: mLabel, onChange: (e) => setMLabel(e.target.value), placeholder: "Family vault", disabled: mBusy })),
+            h("div", null,
+              h(Label, null, "Account email"),
+              h(Input, { value: mEmail, onChange: (e) => setMEmail(e.target.value), placeholder: "you@example.com", disabled: mBusy })),
+            h("div", null,
+              h(Label, null, "Server URL"),
+              h(Input, {
+                value: mServer, onChange: (e) => setMServer(e.target.value),
+                placeholder: "https://vault.example.com", disabled: mBusy,
+              })),
+            h("div", { className: "flex gap-2" },
+              h("div", { className: "flex-1" },
+                h(Label, null, "Folder"),
+                h(Input, { value: mFolder, onChange: (e) => setMFolder(e.target.value), placeholder: "hermes", disabled: mBusy })),
+              h("div", { className: "flex-1" },
+                h(Label, null, "CA cert (self-signed only)"),
+                h(Input, { value: mCa, onChange: (e) => setMCa(e.target.value), placeholder: "omit for public HTTPS", disabled: mBusy }))),
+            h("div", { className: "flex gap-2 justify-end" },
+              h(Button, { type: "button", variant: "ghost", onClick: closeManage, disabled: mBusy }, "Cancel"),
+              h(Button, {
+                type: "submit",
+                disabled: mBusy || (isAdd && (!mId.trim() || mServer.trim() === "" || mServer.trim() === "https://")),
+              }, mBusy && h(Spinner, { className: "h-4 w-4 mr-2" }), isAdd ? "Add vault" : "Save")),
+            removeZone)));
     }
 
     return h("div", { className: "p-6 space-y-6 max-w-3xl mx-auto" },
@@ -378,23 +604,12 @@
             multi
               ? `Secrets in ${vaults.length} Vaultwarden vaults — values never enter chat or logs.`
               : "Secrets in the local Vaultwarden — values never enter chat or logs.")),
-        h("div", { className: "flex items-center gap-2" }, statusBadge,
-          status && status.ok && h(Button, { key: "l", variant: "outline", size: "sm", onClick: doLock, disabled: busy },
-            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
-          status && status.ok && h(Button, { key: "s", variant: "outline", size: "sm", onClick: doSync, disabled: busy },
-            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
-          status && status.ok && h(Button, { key: "se", variant: "outline", size: "sm", onClick: doSyncEnv, disabled: busy },
-            busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync env"))),
+        h(HeaderButtons)),
 
       h(VaultTabs),
 
-      // Selected-vault context line (multi mode only).
-      multi && selMeta && h("p", { key: "vctx", className: "text-sm text-muted-foreground -mt-3" },
-        ["Vault: " + selLabel,
-          selMeta.email ? selMeta.email : null,
-          selMeta.server ? selMeta.server : null,
-          selMeta.folder ? `folder "${selMeta.folder}"` : null,
-        ].filter(Boolean).join(" · ")),
+      h(VaultContext),
+      h(ManageDialog),
 
       error && h(Card, { key: "err" }, h(CardContent, { className: "text-sm text-destructive py-3" },
         multi && !legacy ? `Vault “${selLabel}”: ${error}` : error)),

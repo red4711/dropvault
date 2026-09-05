@@ -389,12 +389,85 @@ def _read_dropvault_section() -> dict:
 
 
 def register(ctx):
-    dv_cfg = _read_dropvault_section()
-    for src in _build_sources(dv_cfg):
+    register_all(ctx, _read_dropvault_section())
+
+
+def register_all(ctx, dv_cfg: dict) -> list:
+    """(Re-)register one source per vault; returns the live source objects.
+
+    Same-name registrations replace the old instance (last-writer-wins),
+    so calling this after a dashboard vault add/edit/remove converges the
+    running gateway without a restart. Sources whose vault vanished from
+    config are left alone here — `prune_removed` handles those.
+    """
+    live = []
+    for src in _build_sources(dv_cfg or {}):
         try:
-            ctx.register_secret_source(src)
+            from agent.secret_sources import registry as _registry
+
+            _registry.register_source(src, replace=True)
+            live.append(src)
         except Exception:
-            continue
+            try:
+                ctx.register_secret_source(src)
+                live.append(src)
+            except Exception:
+                continue
+    return live
+
+
+def prune_removed(ctx, dv_cfg: dict) -> list:
+    """Unregister sources whose vault id left the config. Returns removed names.
+
+    Uses restore_registration(current, previous=None) — the host-owned
+    inverse that only pops when the entry is still ours.
+    """
+    from agent.secret_sources import registry as _registry
+
+    _, vaults = _load_vaults_cfg(dv_cfg or {})
+    lone_default = len(vaults) == 1 and vaults[0].get("id") == "default"
+    wanted = {_source_name_for(v["id"], lone_default) for v in vaults}
+    removed = []
+    try:
+        scope = ctx._manager.scope_key if hasattr(ctx, "_manager") else None
+    except Exception:
+        scope = None
+    try:
+        current = [s for s in _registry.list_plugin_sources()
+                   if s.name == "dropvault" or s.name.startswith("dropvault_")]
+    except Exception:
+        return removed
+    for src in current:
+        if src.name not in wanted:
+            try:
+                if _registry.restore_registration(
+                        src.name, src, None, scope=scope):
+                    removed.append(src.name)
+            except Exception:
+                continue
+    return removed
+
+
+def resync_all(ctx) -> dict:
+    """Re-read config, converge registrations, re-apply env. For the dashboard.
+
+    Called (via trigger file) by the gateway watchdog after vault roster
+    edits. Fail-open: never raises; returns a small status dict.
+    """
+    out: dict = {"registered": [], "pruned": [], "applied": False}
+    try:
+        dv_cfg = _read_dropvault_section()
+        live = register_all(ctx, dv_cfg)
+        out["registered"] = [s.name for s in live]
+        out["pruned"] = prune_removed(ctx, dv_cfg)
+        from hermes_cli.env_loader import (reset_secret_source_cache,
+                                           _apply_external_secret_sources)
+        reset_secret_source_cache()
+        _apply_external_secret_sources(Path.home())
+        out["applied"] = True
+    except Exception as exc:
+        log.warning("dropvault resync failed: %s", exc)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +555,8 @@ def _auto_sync_loop(mins: int) -> None:
 
     Hash per vault (names+values, never logged). Stays silent when vaults
     are locked. On any change — or when the dashboard drops the sync
-    trigger file — resets the secret-source cache and re-applies so the
+    trigger file — converges registrations (vault add/edit/remove needs no
+    gateway restart), resets the secret-source cache and re-applies so the
     running gateway picks up new values without a restart.
     """
     import time
@@ -490,6 +564,7 @@ def _auto_sync_loop(mins: int) -> None:
     trigger = Path.home() / ".hermes" / "cache" / "dropvault-sync.trigger"
     last_hash = None
     last_trigger = ""
+    last_roster = None
     while True:
         time.sleep(max(1, mins) * 60 if mins > 0 else 5)
         try:
@@ -500,6 +575,11 @@ def _auto_sync_loop(mins: int) -> None:
             forced = bool(trig) and trig != last_trigger
             dv_cfg = _read_dropvault_section()
             _, vaults = _load_vaults_cfg(dv_cfg)
+            roster = sorted(v["id"] for v in vaults)
+            roster_changed = roster != last_roster
+            if roster_changed and last_roster is not None:
+                wlog.info("vault roster changed — converging registrations")
+            last_roster = roster
             env = get_source_environment()
             digests = []
             for entry in vaults:
@@ -522,9 +602,40 @@ def _auto_sync_loop(mins: int) -> None:
                 last_trigger = trig
                 if not forced:
                     continue
-            if forced or cur != last_hash:
+            if forced or cur != last_hash or roster_changed:
                 last_hash = cur
                 last_trigger = trig
+                if roster_changed:
+                    # Vault add/edit/remove: converge registrations WITHOUT
+                    # needing a gateway restart (replace=True overwrite +
+                    # prune vanished ids, both fail-open).
+                    try:
+                        from agent.secret_sources import registry as _registry
+
+                        for src in _build_sources(dv_cfg):
+                            try:
+                                _registry.register_source(src, replace=True)
+                            except Exception:
+                                continue
+                        _, _vaults_now = _load_vaults_cfg(dv_cfg)
+                        _lone = (len(_vaults_now) == 1
+                                 and _vaults_now[0].get("id") == "default")
+                        _wanted = {_source_name_for(v["id"], _lone)
+                                   for v in _vaults_now}
+                        try:
+                            for s in _registry.list_plugin_sources():
+                                if (s.name == "dropvault"
+                                        or s.name.startswith("dropvault_")) \
+                                        and s.name not in _wanted:
+                                    try:
+                                        _registry.restore_registration(
+                                            s.name, s, None)
+                                    except Exception:
+                                        continue
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 wlog.info("vault change detected — re-applying secrets to env")
                 from hermes_cli.env_loader import (reset_secret_source_cache,
                                                    _apply_external_secret_sources)

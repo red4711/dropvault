@@ -86,6 +86,13 @@ LEGACY_SESSION_ENV = "BW_SESSION"
 NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
+# Process-wide lock for config.yaml read-modify-write cycles (the dashboard
+# is threaded; two concurrent vault edits must not interleave). The gateway
+# only READS config, so this just serializes dashboard writers.
+import threading as _threading
+
+_CONFIG_LOCK = _threading.RLock()
+
 
 def _valid_vault_id(vid) -> bool:
     return isinstance(vid, str) and bool(vid) and all(c in _ID_CHARS for c in vid)
@@ -116,8 +123,13 @@ def _dropvault_cfg() -> dict:
         return {}
 
 
-def _load_vaults() -> list:
-    """Configured vaults with legacy flat config migrated to id=default."""
+def _load_vaults(*, include_disabled: bool = False) -> list:
+    """Configured vaults with legacy flat config migrated to id=default.
+
+    Disabled vaults are SKIPPED by default (they're invisible to the
+    gateway); pass include_disabled=True for the dashboard roster, which
+    must show them greyed-out with an enable toggle.
+    """
     dv = _dropvault_cfg()
     raw = dv.get("vaults")
     if isinstance(raw, list) and raw:
@@ -129,7 +141,7 @@ def _load_vaults() -> list:
             if not _valid_vault_id(vid) or vid in seen:
                 continue
             seen.add(vid)
-            if not entry.get("enabled", True):
+            if not include_disabled and not entry.get("enabled", True):
                 continue
             merged = dict(entry)
             merged.setdefault("folder", dv.get("folder", DEFAULT_FOLDER))
@@ -354,9 +366,11 @@ def _vault_summary(cfg: dict) -> dict:
         "label": cfg.get("label") or vid,
         "ok": vault_state == "unlocked",
         "vault": vault_state,
-        "email": email,
+        "email": email or (str(cfg.get("email") or "") or None),
         "server": server or (str(cfg.get("server_url") or "") or None),
         "folder": str(cfg.get("folder") or DEFAULT_FOLDER),
+        "enabled": bool(cfg.get("enabled", True)),
+        "has_ca": bool(cfg.get("ca_cert")),
     }
 
 
@@ -381,13 +395,51 @@ class VaultBody(BaseModel):
     vault: Optional[str] = None
 
 
+class VaultUpsertBody(BaseModel):
+    """Add a vault, or edit an existing one (same id = update).
+
+    Only plain connection fields — never secrets or sessions.
+    `id` is [a-z0-9_]+; `server_url` must be http(s); `ca_cert` must be
+    an existing file when given. Omit `ca_cert` for public HTTPS.
+    """
+
+    id: str
+    label: Optional[str] = None
+    email: Optional[str] = None
+    server_url: Optional[str] = None
+    folder: Optional[str] = None
+    ca_cert: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class VaultRemoveBody(BaseModel):
+    vault: Optional[str] = None
+    forget_session: Optional[bool] = True
+
+
+# Resolve string annotations NOW: the dashboard imports this file via
+# spec_from_file_location under a synthetic module name
+# (hermes_dashboard_plugin_dropvault), and pydantic/FastAPI resolve
+# `Optional[...]` against that module's namespace at first request —
+# without this, every model fails with "not fully defined".
+UnlockBody.model_rebuild(force=True)
+SecretBody.model_rebuild(force=True)
+VaultBody.model_rebuild(force=True)
+VaultUpsertBody.model_rebuild(force=True)
+VaultRemoveBody.model_rebuild(force=True)
+
+
 # ---------------------------------------------------------------------------
 
 
 @router.get("/vaults")
 def list_vaults():
-    """Roster of configured vaults with lock state (no values)."""
-    return {"vaults": [_vault_summary(v) for v in _load_vaults()]}
+    """Roster of configured vaults with lock state (no values).
+
+    Includes DISABLED vaults (greyed out in the UI with an enable
+    toggle) — every other route skips them.
+    """
+    return {"vaults": [_vault_summary(v) for v in _load_vaults(include_disabled=True)]}
 
 
 def _status_for(cfg: dict):
@@ -578,6 +630,237 @@ def lock(body: VaultBody = None):
     vid = (body.vault if body and body.vault else None)
     _store_session(_vault_cfg(vid), "")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Vault roster management (add / edit / remove / enable). These rewrite
+# secrets.dropvault.vaults in config.yaml via ruamel (round-trip: comments
+# and layout preserved); legacy flat configs are migrated to vaults[0]
+# first. Secrets (passwords, sessions) are never accepted or written here.
+# ---------------------------------------------------------------------------
+
+_VAULT_EDITABLE_KEYS = (
+    "label", "email", "server_url", "folder", "ca_cert", "enabled",
+)
+
+
+def _read_raw_config() -> dict:
+    import yaml
+    try:
+        data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_raw_config(data: dict) -> None:
+    """Atomic config.yaml rewrite via ruamel round-trip (comments kept).
+
+    Falls back to yaml.safe_dump when ruamel is unavailable. Preserves the
+    file's mode/owner (0600 hermes-agent in practice).
+    """
+    st = CONFIG_PATH.stat() if CONFIG_PATH.exists() else None
+    tmp = CONFIG_PATH.with_suffix(".tmp.dropvault")
+    try:
+        from ruamel.yaml import YAML as _YAML
+
+        _rt = _YAML(typ="rt")
+        _rt.preserve_quotes = True
+        _rt.indent(mapping=2, sequence=4, offset=2)
+        with open(tmp, "w", encoding="utf-8") as f:
+            _rt.dump(data, f)
+    except Exception:
+        import yaml as _yaml
+
+        tmp.write_text(_yaml.safe_dump(
+            data, default_flow_style=False, sort_keys=False,
+            allow_unicode=True))
+    os.chmod(tmp, 0o600 if st is None else (st.st_mode & 0o777))
+    try:
+        import shutil as _shutil
+        _shutil.chown(tmp, st.st_uid, st.st_gid)
+    except Exception:
+        pass
+    os.replace(tmp, CONFIG_PATH)
+
+
+def _migrate_flat_to_vaults(dv: dict) -> list:
+    """Return the vaults list, migrating legacy flat keys into vaults[0].
+
+    Mutates `dv` in place (moves flat keys into the vault entry) and
+    returns the live list object inside `dv` so callers can edit it.
+    """
+    raw = dv.get("vaults")
+    if isinstance(raw, list) and raw:
+        return raw
+    legacy_keys = ("folder", "email", "server_url", "ca_cert",
+                   "cli_path", "cli_data_dir", "cli_timeout_seconds")
+    entry: dict = {"id": "default"}
+    for k in legacy_keys:
+        if k in dv and dv[k] is not None:
+            entry[k] = dv.pop(k)
+    entry.setdefault("folder", DEFAULT_FOLDER)
+    dv["vaults"] = [entry]
+    return dv["vaults"]
+
+
+def _validate_vault_fields(body: VaultUpsertBody, *, is_new: bool) -> dict:
+    """Validate + normalize an add/edit payload. 422 on bad input."""
+    vid = (body.id or "").strip().lower()
+    if not _valid_vault_id(vid):
+        raise HTTPException(
+            422, "vault id must match [a-z0-9_]+ (lowercase, digits, underscore)")
+    if is_new and vid == "default" and _load_vaults():
+        # 'default' is the migrated legacy vault — a second claimant is a
+        # user error, not a silent takeover.
+        raise HTTPException(
+            409, "vault 'default' already exists — edit it instead")
+    out: dict = {"id": vid}
+    if body.label is not None:
+        out["label"] = body.label.strip() or vid
+    if body.email is not None:
+        email = body.email.strip()
+        if email and ("@" not in email or " " in email):
+            raise HTTPException(422, "email doesn't look like an email address")
+        out["email"] = email
+    if body.server_url is not None:
+        url = body.server_url.strip().rstrip("/")
+        if url and not (url.startswith("https://") or url.startswith("http://")):
+            raise HTTPException(422, "server_url must start with https:// (or http://)")
+        out["server_url"] = url
+    if body.folder is not None:
+        folder = body.folder.strip()
+        if folder and not re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\- ]{0,127}$", folder):
+            raise HTTPException(422, "folder name looks invalid")
+        out["folder"] = folder or DEFAULT_FOLDER
+    if body.ca_cert is not None:
+        ca = body.ca_cert.strip()
+        if ca and not os.path.isfile(os.path.expanduser(ca)):
+            raise HTTPException(422, f"ca_cert file not found: {ca}")
+        out["ca_cert"] = ca
+    if body.enabled is not None:
+        out["enabled"] = bool(body.enabled)
+    return out
+
+
+@router.post("/vaults")
+def add_vault(body: VaultUpsertBody):
+    """Add a vault (connection fields only), or 409 if the id exists."""
+    fields = _validate_vault_fields(body, is_new=True)
+    if not fields.get("server_url"):
+        raise HTTPException(422, "server_url is required when adding a vault")
+    with _CONFIG_LOCK:
+        data = _read_raw_config()
+        dv = ((data.get("secrets") or {}).get("dropvault") or {})
+        if not isinstance(dv, dict):
+            raise HTTPException(500, "secrets.dropvault is not a mapping")
+        vaults = _migrate_flat_to_vaults(dv)
+        if any(isinstance(v, dict) and v.get("id") == fields["id"] for v in vaults):
+            raise HTTPException(
+                409, f"vault '{fields['id']}' already exists — edit it instead")
+        entry = {"id": fields["id"], "enabled": True,
+                 "folder": DEFAULT_FOLDER}
+        for k in _VAULT_EDITABLE_KEYS:
+            if k in fields:
+                entry[k] = fields[k]
+        vaults.append(entry)
+        data.setdefault("secrets", {})["dropvault"] = dv
+        try:
+            _write_raw_config(data)
+        except Exception as exc:
+            raise HTTPException(500, f"cannot save config: {exc}")
+    _drop_sync_trigger()
+    return {"ok": True, "id": fields["id"], "created": True}
+
+
+@router.put("/vaults/{vid}")
+def edit_vault(vid: str, body: VaultUpsertBody):
+    """Edit a vault's connection fields (id in path wins; never the session)."""
+    if body.id and body.id.strip().lower() != vid:
+        raise HTTPException(422, "vault id is immutable — remove + re-add to rename")
+    fields = _validate_vault_fields(body, is_new=False)
+    fields["id"] = vid
+    with _CONFIG_LOCK:
+        data = _read_raw_config()
+        dv = ((data.get("secrets") or {}).get("dropvault") or {})
+        if not isinstance(dv, dict):
+            raise HTTPException(500, "secrets.dropvault is not a mapping")
+        vaults = _migrate_flat_to_vaults(dv)
+        target = next((v for v in vaults
+                       if isinstance(v, dict) and v.get("id") == vid), None)
+        if target is None:
+            raise HTTPException(404, f"unknown vault '{vid}'")
+        for k in _VAULT_EDITABLE_KEYS:
+            if k in fields:
+                if fields[k] == "" and k in ("label", "email", "server_url", "ca_cert"):
+                    target.pop(k, None)
+                else:
+                    target[k] = fields[k]
+        data.setdefault("secrets", {})["dropvault"] = dv
+        try:
+            _write_raw_config(data)
+        except Exception as exc:
+            raise HTTPException(500, f"cannot save config: {exc}")
+    _drop_sync_trigger()
+    return {"ok": True, "id": vid}
+
+
+@router.delete("/vaults/{vid}")
+def remove_vault(vid: str, body: VaultRemoveBody = None):
+    """Remove a vault from config.
+
+    Drops its session from ~/.hermes/.env (unless forget_session=false).
+    Removes its `secrets.dropvault_<id>` override section if present.
+    The CLI state dir is KEPT (client cache only; re-add resumes instantly).
+    Refuses to remove the last remaining vault — disable it instead.
+    """
+    forget = True if body is None else body.forget_session is not False
+    with _CONFIG_LOCK:
+        data = _read_raw_config()
+        secrets = data.get("secrets") or {}
+        dv = secrets.get("dropvault") or {}
+        if not isinstance(dv, dict):
+            raise HTTPException(500, "secrets.dropvault is not a mapping")
+        vaults = _migrate_flat_to_vaults(dv)
+        ids = [v.get("id") for v in vaults if isinstance(v, dict)]
+        if vid not in ids:
+            raise HTTPException(404, f"unknown vault '{vid}'")
+        if len(ids) <= 1:
+            raise HTTPException(
+                409, "cannot remove the last vault — disable it instead")
+        dv["vaults"] = [v for v in vaults
+                        if not (isinstance(v, dict) and v.get("id") == vid)]
+        # Drop a per-source override section for the removed vault.
+        for key in (f"dropvault_{vid}",):
+            if key in secrets:
+                del secrets[key]
+        data["secrets"]["dropvault"] = dv
+        try:
+            _write_raw_config(data)
+        except Exception as exc:
+            raise HTTPException(500, f"cannot save config: {exc}")
+    if forget:
+        try:
+            _store_session({"id": vid,
+                            "session_env": _session_env_for(vid)}, "")
+        except Exception:
+            pass
+    _drop_sync_trigger()
+    return {"ok": True, "id": vid, "removed": True}
+
+
+def _drop_sync_trigger() -> None:
+    """Nudge the gateway watchdog to re-read config within ~5s."""
+    try:
+        trigger = Path.home() / ".hermes" / "cache" / "dropvault-sync.trigger"
+        trigger.parent.mkdir(parents=True, exist_ok=True)
+        trigger.write_text(str(time.time()))
+        try:
+            trigger.chmod(0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 @router.post("/sync")

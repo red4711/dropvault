@@ -16,7 +16,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install cryptography pyyaml requests
+        run: pip install cryptography pyyaml requests fastapi pydantic ruamel.yaml
 
       - name: Syntax + import checks
         run: |
@@ -79,6 +79,82 @@ jobs:
           iv, ct, mac = (base64.b64decode(x) for x in rest.split("|"))
           assert hmac.new(sk[32:], iv + ct, hashlib.sha256).digest() == mac
           print("crypto round-trips OK")
+          EOF
+
+      - name: Dashboard API unit checks (vault roster mgmt)
+        # NOTE: fastapi/pydantic/ruamel.yaml come from the Install-deps step
+        # above (CI runner has pip). The block uses temp config/env copies —
+        # live files are never touched.
+        run: |
+          python - <<'EOF'
+          import importlib.util, shutil
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location(
+              "dvapi", "dashboard/plugin_api.py")
+          m = importlib.util.module_from_spec(spec)
+          import sys
+          sys.modules["dvapi"] = m
+          spec.loader.exec_module(m)
+
+          # pydantic models resolve under the synthetic module name
+          for cls in (m.UnlockBody, m.SecretBody, m.VaultBody,
+                      m.VaultUpsertBody, m.VaultRemoveBody):
+              assert cls.__pydantic_complete__, cls.__name__
+
+          # 2FA helpers
+          assert m.TWO_FACTOR_METHODS == {0: "Authenticator", 1: "Email", 3: "YubiKey OTP"}
+          assert m.is_two_factor_challenge("Code is required.")
+          assert not m.is_two_factor_challenge("Username or password is incorrect")
+          argv = m.login_argv("bw", "a@b.c", method=0, code="123")
+          assert argv == ["bw", "login", "a@b.c", "--raw", "--passwordenv",
+                          "BW_PASSWORD", "--method", "0", "--code", "123"]
+
+          # roster mgmt against temp config/env copies (live files untouched)
+          import tempfile
+          work = Path(tempfile.mkdtemp())
+          (work / "config.yaml").write_text(
+              "secrets:\n  dropvault:\n    enabled: true\n    folder: hermes\n"
+              "    email: a@b.c\n    ca_cert: /nonexistent-ca.crt\n")
+          (work / "env").write_text("")
+          m.CONFIG_PATH = work / "config.yaml"
+          m.HERMES_ENV = work / "env"
+
+          assert [v["id"] for v in m.list_vaults()["vaults"]] == ["default"]
+          out = m.add_vault(m.VaultUpsertBody(id="primary", server_url="https://vault.example.com"))
+          assert out == {"ok": True, "id": "primary", "created": True}
+          try:
+              m.add_vault(m.VaultUpsertBody(id="primary", server_url="https://x.example.com"))
+              raise SystemExit("expected 409")
+          except Exception as e:
+              assert getattr(e, "status_code", None) == 409
+          for bad in (dict(id="BAD!", server_url="https://x.example.com"),
+                      dict(id="ok2", server_url="ftp://x"),
+                      dict(id="ok3")):
+              try:
+                  m.add_vault(m.VaultUpsertBody(**bad))
+                  raise SystemExit(f"expected 422 for {bad}")
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  assert getattr(e, "status_code", None) == 422, (bad, e)
+          assert [v["id"] for v in m.list_vaults()["vaults"]] == ["default", "primary"]
+          m.edit_vault("primary", m.VaultUpsertBody(id="primary", label="P", folder="shared"))
+          v = next(v for v in m.list_vaults()["vaults"] if v["id"] == "primary")
+          assert v["label"] == "P" and v["folder"] == "shared", v
+          m.edit_vault("primary", m.VaultUpsertBody(id="primary", enabled=False))
+          v = next(v for v in m.list_vaults()["vaults"] if v["id"] == "primary")
+          assert v["enabled"] is False, v  # roster shows disabled vaults
+          out = m.remove_vault("primary", m.VaultRemoveBody())
+          assert out == {"ok": True, "id": "primary", "removed": True}
+          assert [v["id"] for v in m.list_vaults()["vaults"]] == ["default"]
+          try:
+              m.remove_vault("default", m.VaultRemoveBody())
+              raise SystemExit("expected 409")
+          except SystemExit:
+              raise
+          except Exception as e:
+              assert getattr(e, "status_code", None) == 409
+          print("dashboard API unit checks OK")
           EOF
 
       - name: Manifest sanity
