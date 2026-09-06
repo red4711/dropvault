@@ -394,6 +394,24 @@ def _folder_id(cfg: dict, session: str) -> str:
     return json.loads(proc.stdout)["id"]
 
 
+def _is_stale_revision(stderr: str) -> bool:
+    """True when bw failed because another client edited the cipher first."""
+    return "out of date" in (stderr or "").lower()
+
+
+def _sync_best_effort(cfg: dict, session: str) -> None:
+    """Refresh the local bw cache from the server (best-effort, never raises).
+
+    Another client may have edited a cipher since our last sync; without
+    this, `bw edit` sends a stale lastKnownRevisionDate and the server
+    rejects it with "client copy of this cipher is out of date".
+    """
+    try:
+        _run_bw(cfg, ["sync"], session=session, timeout=90)
+    except Exception:
+        pass
+
+
 def _find_item(cfg: dict, session: str, scope_argv: list,
                name: str) -> Optional[dict]:
     items = _run_bw_json(cfg, scope_argv, session=session, timeout=90)
@@ -589,6 +607,7 @@ def upsert_secret(body: SecretBody):
     if not body.value:
         raise HTTPException(422, "value must not be empty")
 
+    _sync_best_effort(cfg, session)  # another client may have touched the item
     scope = _create_target(cfg, session)
     scope_argv, _ = _scope_items_argv(cfg, session)
     if scope_argv is None:
@@ -609,6 +628,13 @@ def upsert_secret(body: SecretBody):
     else:
         argv = ["create", "item", _b64(item)]
     proc = _run_bw(cfg, argv, session=session, stdin_data="", timeout=60)
+    if proc.returncode != 0 and existing and _is_stale_revision(proc.stderr):
+        # Lost a race with another client: refresh local cache, retry once.
+        _sync_best_effort(cfg, session)
+        existing = _find_item(cfg, session, scope_argv, name) or existing
+        payload = {**existing, **item, "id": existing["id"]}
+        proc = _run_bw(cfg, ["edit", "item", existing["id"], _b64(payload)],
+                       session=session, stdin_data="", timeout=60)
     if proc.returncode != 0:
         raise HTTPException(502, f"bw write failed: {proc.stderr.strip()[:200]}")
     out = json.loads(proc.stdout)
