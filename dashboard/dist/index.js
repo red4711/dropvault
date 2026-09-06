@@ -118,6 +118,16 @@
     const [mFolder, setMFolder] = useState(""); // legacy back-compat (optional)
     const [mCollection, setMCollection] = useState("");
     const [mCa, setMCa] = useState("");
+    // Remount key for the add/edit form: bumped on every open so the
+    // dialog identity stays stable (no focus jumps) yet inputs reset.
+    const [manageKey, setManageKey] = useState(0);
+    // One-shot autofocus for the ID field on open (ref callback fires on
+    // mount only — no autoFocus prop, which can re-fire on re-renders).
+    const idAutofocusRef = useCallback((el) => {
+      if (el && typeof el.focus === "function") {
+        try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+      }
+    }, []);
     const [mBusy, setMBusy] = useState(false);
     const [mError, setMError] = useState(null);
     const [confirmRemove, setConfirmRemove] = useState(null); // vault id | null
@@ -333,13 +343,13 @@
     function openAddVault() {
       setMId(""); setMLabel(""); setMEmail("");
       setMServer("https://"); setMFolder(""); setMCollection("");
-      setMCa(""); setMError(null); setManageOpen("add");
+      setMCa(""); setMError(null); setManageKey((k) => k + 1); setManageOpen("add");
     }
     function openEditVault(v) {
       setMId(v.id); setMLabel(v.label && v.label !== v.id ? v.label : "");
       setMEmail(v.email || ""); setMServer(v.server || "");
       setMFolder(v.folder || ""); setMCollection(v.collection || "");
-      setMCa(""); setMError(null); setManageOpen({ mode: "edit", id: v.id });
+      setMCa(""); setMError(null); setManageKey((k) => k + 1); setManageOpen({ mode: "edit", id: v.id });
     }
     function closeManage() {
       if (mBusy) return;
@@ -580,89 +590,92 @@
         return h(Card, { key: "vcard" },
           h(CardContent, { className: "py-4 space-y-2" }, head, conn));
       }
+      const unlockForm = st && !st.ok && h("form", { key: "unlock", onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
+        h("div", { className: "flex-1 space-y-3 min-w-52" },
+          h("div", { key: "pw" },
+            h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
+            h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
+                       placeholder: "vault master password", autoFocus: !tfa, disabled: unlocking })),
+          tfa && h("div", { key: "tfa", className: "flex gap-2 items-end" },
+            h("div", null,
+              h(Label, null, "Method"),
+              h("select", {
+                value: tfa.method, disabled: unlocking,
+                onChange: (e) => setTfa(Object.assign({}, tfa, { method: Number(e.target.value) })),
+                className: "h-9 rounded-md border border-input bg-background px-2 text-sm",
+                "aria-label": "Two-step login method",
+              }, tfa.methods.map((m) =>
+                h("option", { key: m.id, value: m.id }, m.name)))),
+            h("div", { className: "flex-1" },
+              h(Label, null, "Two-step code"),
+              h(Input, {
+                value: tfa.code, inputMode: "numeric", autoComplete: "one-time-code",
+                autoFocus: true, disabled: unlocking,
+                onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
+                placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
+              })))),
+        h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code), className: nb },
+          unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
+          unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock"));
+      const cliHint = st && !st.cli && h("p", { key: "cli", className: "text-sm" },
+        "The bw CLI is not installed on this host. Install with: npm install -g @bitwarden/cli");
+      // actions + secrets (this vault only)
+      const actionRow = st && st.ok && h("div", { key: "actions", className: "flex items-center gap-2 flex-wrap" },
+        h(Button, { variant: "outline", size: "sm", onClick: doLock, disabled: busy, className: nb },
+          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
+        h(Button, { variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
+          busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
+        h("span", { className: "text-xs text-muted-foreground" }, scopeClause));
+      const secretForm = st && st.ok && showForm && h("form", { key: "form", onSubmit: doSave, className: "space-y-3 border-t pt-3" },
+        h("div", null,
+          h(Label, null, "Name (env var)"),
+          h(Input, { value: name, onChange: (e) => setName(e.target.value.toUpperCase()),
+                     placeholder: "OPENROUTER_API_KEY", disabled: !!editName, autoFocus: true })),
+        h("div", null,
+          h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
+          h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
+                     placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
+        h("div", { className: "flex gap-2 justify-end" },
+          h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
+          h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
+            busy && h(Spinner, { className: "h-4 w-4 mr-2" }),
+            editName ? "Update" : "Create")));
+      const loadingRow = st && st.ok && secrets === null && h("div", { key: "load", className: "py-2" }, SecretSkeleton());
+      const secretList = st && st.ok && secrets && (secrets.length === 0
+        ? h("p", { key: "empty", className: "text-sm text-muted-foreground py-4 text-center" },
+            "No secrets yet. Add one — it becomes an environment variable for Hermes tools.")
+        : h("div", { key: "list" },
+            h("div", { className: "flex items-center justify-end pb-1" },
+              h(Button, { size: "sm", onClick: openNew, disabled: busy, className: nb }, "Add secret")),
+            h("ul", { className: "divide-y" },
+              secrets.map((s) =>
+                h("li", { key: s.name, className: "flex items-center justify-between py-2" },
+                  h("span", { className: "text-sm" }, s.name),
+                  h("div", { className: "flex items-center gap-2" },
+                    h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))));
       return h(Card, { key: "vcard" },
-        h(CardContent, { className: "py-4 space-y-4" }, head, conn,
-          // unlock form (this vault only)
-          st && !st.ok && h("form", { key: "unlock", onSubmit: doUnlock, className: "flex gap-2 items-end flex-wrap" },
-            h("div", { className: "flex-1 space-y-3 min-w-52" },
-              h("div", null,
-                h(Label, null, multi && !legacy ? `Master password — vault “${selLabel}”` : "Master password"),
-                h(Input, { type: "password", value: pw, onChange: (e) => setPw(e.target.value),
-                           placeholder: "vault master password", autoFocus: !tfa, disabled: unlocking })),
-              tfa && h("div", { className: "flex gap-2 items-end" },
-                h("div", null,
-                  h(Label, null, "Method"),
-                  h("select", {
-                    value: tfa.method, disabled: unlocking,
-                    onChange: (e) => setTfa(Object.assign({}, tfa, { method: Number(e.target.value) })),
-                    className: "h-9 rounded-md border border-input bg-background px-2 text-sm",
-                    "aria-label": "Two-step login method",
-                  }, tfa.methods.map((m) =>
-                    h("option", { key: m.id, value: m.id }, m.name)))),
-                h("div", { className: "flex-1" },
-                  h(Label, null, "Two-step code"),
-                  h(Input, {
-                    value: tfa.code, inputMode: "numeric", autoComplete: "one-time-code",
-                    autoFocus: true, disabled: unlocking,
-                    onChange: (e) => setTfa(Object.assign({}, tfa, { code: e.target.value.replace(/\s+/g, "") })),
-                    placeholder: tfa.method === 1 ? "emailed code" : "6-digit code",
-                  })))),
-            h(Button, { type: "submit", disabled: unlocking || !pw || !!(tfa && !tfa.code), className: nb },
-              unlocking && h(Spinner, { className: "h-4 w-4 mr-2" }),
-              unlocking ? "Unlocking…" : tfa ? "Verify & unlock" : "Unlock")),
-          st && !st.cli && h("p", { key: "cli", className: "text-sm" },
-            "The bw CLI is not installed on this host. Install with: npm install -g @bitwarden/cli"),
-          // actions + secrets (this vault only)
-          st && st.ok && h("div", { key: "actions", className: "flex items-center gap-2 flex-wrap" },
-            h(Button, { variant: "outline", size: "sm", onClick: doLock, disabled: busy, className: nb },
-              busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Lock"),
-            h(Button, { variant: "outline", size: "sm", onClick: doSync, disabled: busy, className: nb },
-              busy ? h(Spinner, { className: "h-3.5 w-3.5 mr-1.5" }) : null, "Sync"),
-            h("span", { className: "text-xs text-muted-foreground" }, scopeClause)),
-          st && st.ok && showForm && h("form", { key: "form", onSubmit: doSave, className: "space-y-3 border-t pt-3" },
-            h("div", null,
-              h(Label, null, "Name (env var)"),
-              h(Input, { value: name, onChange: (e) => setName(e.target.value.toUpperCase()),
-                         placeholder: "OPENROUTER_API_KEY", disabled: !!editName, autoFocus: true })),
-            h("div", null,
-              h(Label, null, editName ? `New value for ${editName} (leave blank to keep current)` : "Value"),
-              h(Input, { type: "text", value: value, onChange: (e) => setValue(e.target.value),
-                         placeholder: editName ? "(unchanged — leave blank to keep)" : "secret value" })),
-            h("div", { className: "flex gap-2 justify-end" },
-              h(Button, { type: "button", variant: "ghost", onClick: () => setShowForm(false) }, "Cancel"),
-              h(Button, { type: "submit", disabled: busy || !name || (!editName && !value) },
-                busy && h(Spinner, { className: "h-4 w-4 mr-2" }),
-                editName ? "Update" : "Create"))),
-          st && st.ok && secrets === null && h("div", { key: "load", className: "py-2" }, h(SecretSkeleton)),
-          st && st.ok && secrets && (secrets.length === 0
-            ? h("p", { key: "empty", className: "text-sm text-muted-foreground py-4 text-center" },
-                "No secrets yet. Add one — it becomes an environment variable for Hermes tools.")
-            : h("div", { key: "list" },
-                h("div", { className: "flex items-center justify-end pb-1" },
-                  h(Button, { size: "sm", onClick: openNew, disabled: busy, className: nb }, "Add secret")),
-                h("ul", { className: "divide-y" },
-                  secrets.map((s) =>
-                    h("li", { key: s.name, className: "flex items-center justify-between py-2" },
-                      h("span", { className: "text-sm" }, s.name),
-                      h("div", { className: "flex items-center gap-2" },
-                        h(Button, { variant: "ghost", size: "sm", onClick: () => openEdit(s.name), key: "e" }, "Update")))))))));
+        h(CardContent, { className: "py-4 space-y-4" }, head, conn, unlockForm, cliHint,
+          actionRow, secretForm, loadingRow, secretList));
     }
 
     // Add/edit vault dialog + remove confirmation.
+    // NOTE: this must be called unconditionally (hooks + stable DOM
+    // identity). openAddVault/openEditVault reset a `manageKey` so the
+    // form remounts fresh per open, instead of unmounting modules.
     function ManageDialog() {
-      if (!manageOpen) return null;
       const isAdd = manageOpen === "add";
       const idInput = isAdd
         ? h("div", null,
             h(Label, null, "ID (lowercase, digits, underscore)"),
             h(Input, {
               value: mId, onChange: (e) => setMId(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "")),
-              placeholder: "primary", autoFocus: true, disabled: mBusy,
+              placeholder: "primary", disabled: mBusy,
+              ref: idAutofocusRef,
             }))
         : h("div", null,
             h(Label, null, "ID"),
-            h(Input, { value: manageOpen.id, disabled: true }));
-      const removeZone = !isAdd && h("div", { className: "border-t pt-3 mt-1" },
+            h(Input, { value: (manageOpen && manageOpen.id) || "", disabled: true }));
+      const removeZone = !isAdd && manageOpen && h("div", { className: "border-t pt-3 mt-1" },
         confirmRemove !== manageOpen.id
           ? h(Button, {
               variant: "ghost", size: "sm", disabled: mBusy,
@@ -678,7 +691,8 @@
                   variant: "destructive", size: "sm", disabled: mBusy,
                   onClick: () => doRemoveVault(manageOpen.id),
                 }, mBusy && h(Spinner, { className: "h-4 w-4 mr-2" }), "Remove vault"))));
-      return h(Card, { key: "manage" },
+      if (!manageOpen) return null;
+      return h(Card, { key: "manage" + manageKey },
         h(CardContent, { className: "py-4" },
           h("form", { onSubmit: doSaveVault, className: "space-y-3" },
             h("h2", { className: "text-lg font-medium" },
